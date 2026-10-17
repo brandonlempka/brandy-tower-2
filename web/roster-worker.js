@@ -227,8 +227,28 @@ ${events.length ? '' : '<div class="empty">No events counted yet.</div>'}
 </div></body></html>`;
 }
 
+/* The read-only pages are served from the edge cache for a minute: every
+ * uncached GET costs two KV list() calls, and the free plan allows 1,000
+ * lists a day, which a single crawler burned half of on 2026-10-17. */
+const CACHE_TTL = 60;
+async function cached(req, ctx, make) {
+  const cache = caches.default;
+  const key = new Request(new URL(req.url).origin + new URL(req.url).pathname, { method: 'GET' });
+  const hit = await cache.match(key);
+  if (hit) {
+    const res = new Response(hit.body, hit);
+    res.headers.set('X-Roster-Cache', 'hit');
+    return res;
+  }
+  const res = await make();
+  res.headers.set('Cache-Control', `public, max-age=${CACHE_TTL}`);
+  res.headers.set('X-Roster-Cache', 'miss');
+  ctx.waitUntil(cache.put(key, res.clone()));
+  return res;
+}
+
 export default {
-  async fetch(req, env) {
+  async fetch(req, env, ctx) {
     const url = new URL(req.url);
     if (req.method === 'OPTIONS')
       return new Response(null, { status: 204, headers: corsHeaders(req) });
@@ -242,21 +262,23 @@ export default {
       return res;
     }
     if (req.method === 'GET' && url.pathname === '/towers.json') {
-      return new Response(JSON.stringify(await listTowers(env), null, 1), {
+      return cached(req, ctx, async () => new Response(JSON.stringify(await listTowers(env), null, 1), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders(req) },
-      });
+      }));
     }
     if (req.method === 'GET' && url.pathname === '/events.json') {
-      return new Response(
+      return cached(req, ctx, async () => new Response(
         JSON.stringify(Object.fromEntries(await listEvents(env)), null, 1), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders(req) },
-      });
+      }));
     }
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '')) {
-      const [towers, events] =
-        await Promise.all([listTowers(env), listEvents(env)]);
-      return new Response(rosterPage(towers, events), {
-        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      return cached(req, ctx, async () => {
+        const [towers, events] =
+          await Promise.all([listTowers(env), listEvents(env)]);
+        return new Response(rosterPage(towers, events), {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        });
       });
     }
     return new Response('not found', { status: 404 });
