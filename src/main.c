@@ -544,6 +544,13 @@ typedef struct {
      * hit-tests are shared; only the paint differs. --ui=modern /
      * CT_UI=modern at launch; the web shell remembers it. */
     uint8_t         ui_modern;
+    /* Modern UI build dock (BrandyTower's palette): scroll offset along
+     * the dock's axis, a touch drag-scroll in progress, and the fling
+     * velocity (px/ms) it leaves behind. */
+    float           dock_scroll, dock_vel;
+    int             dock_dragging;
+    float           dock_drag_pos0, dock_scroll0, dock_last_pos;
+    Uint32          dock_last_ms;
 
     /* SmoothScroll (CameraT 1080): minimap click-nav animates the camera
      * to the target instead of jumping (pass-3 trace: map click-nav =
@@ -5909,11 +5916,462 @@ static void render_speed_window(void)
     }
 }
 
+/* ---------- Modern UI build dock (port addition, 2026-10-31) ----------
+ * BrandyTower's build palette in place of the Win3.1 toolbox: every item
+ * on show at once under a group heading, icon over name, locked ones
+ * greyed rather than hidden (so the shape of the game ahead is visible
+ * from the first star), and a hover tooltip saying what each one does and
+ * what it takes. A side-mounted column on a wide view; on a narrow one
+ * (phones) a strip along the bottom that slides sideways under a thumb.
+ * The classic skin keeps the faithful toolbox. */
+#define DOCK_W          96   /* side column */
+#define DOCK_PAD        6
+#define DOCK_HEAD_H     16
+#define DOCK_BTN_H      48
+#define DOCK_GAP        4
+#define DOCK_GROUP_GAP  8
+#define DOCK_H          (DOCK_PAD + DOCK_HEAD_H + DOCK_BTN_H + DOCK_PAD + 4)
+#define DOCK_TIP_MS     300  /* hover delay: snappier than the world's */
+#define DOCK_SLOTS_MAX  32
+/* Hand tools share the item slots, as negative ids. */
+#define DOCK_INSPECT    (-1)
+#define DOCK_FINGER     (-2)
+#define DOCK_REMOVE     (-3)
+
+typedef struct { const char *title; int items[6]; int n; } DockGroup;
+
+/* BrandyTower's grouping (src/ui/toolbar.ts GROUPS), hand tools first —
+ * they are what you reach for between builds. */
+static const DockGroup DOCK_GROUPS[] = {
+    { "TOOLS",     { DOCK_INSPECT, DOCK_FINGER, DOCK_REMOVE }, 3 },
+    { "STRUCTURE", { ITEM_LOBBY, ITEM_FLOOR, ITEM_STAIRS, ITEM_ESCALATOR }, 4 },
+    { "ELEVATORS", { ITEM_ELEVATOR_SHAFT, ITEM_ELEVATOR_SERVICE,
+                     ITEM_ELEVATOR_EXPRESS }, 3 },
+    { "TENANTS",   { ITEM_OFFICE, ITEM_CONDO }, 2 },
+    { "HOTEL",     { ITEM_HOTEL_SINGLE, ITEM_HOTEL_TWIN, ITEM_HOTEL_SUITE,
+                     ITEM_HOUSEKEEPING }, 4 },
+    { "COMMERCE",  { ITEM_FAST_FOOD, ITEM_RESTAURANT, ITEM_SHOP, ITEM_CINEMA,
+                     ITEM_PARTY_HALL }, 5 },
+    { "SERVICES",  { ITEM_SECURITY, ITEM_MEDICAL, ITEM_RECYCLING }, 3 },
+    { "BELOW",     { ITEM_RAMP, ITEM_PARKING, ITEM_METRO }, 3 },
+    { "LANDMARK",  { ITEM_CATHEDRAL }, 1 },
+};
+#define DOCK_GROUP_COUNT ((int)(sizeof DOCK_GROUPS / sizeof DOCK_GROUPS[0]))
+
+typedef struct {
+    int      horizontal;                 /* bottom strip (narrow view) */
+    SDL_Rect view;                       /* the panel on screen */
+    int      content;                    /* length along the scroll axis */
+    int      n;
+    int      item[DOCK_SLOTS_MAX];
+    SDL_Rect r[DOCK_SLOTS_MAX];          /* content coords, unscrolled */
+    SDL_Rect head[DOCK_GROUP_COUNT];
+} DockLayout;
+
+static int dock_active(void) { return game.ui_modern && game.win_toolbar; }
+
+static const char *dock_label(int item)
+{
+    switch (item) {
+    case DOCK_INSPECT:          return "Inspect";
+    case DOCK_FINGER:           return "Finger";
+    case DOCK_REMOVE:           return "Remove";
+    case ITEM_LOBBY:            return "Lobby";
+    case ITEM_FLOOR:            return "Floor";
+    case ITEM_STAIRS:           return "Stairs";
+    case ITEM_ESCALATOR:        return "Escalator";
+    case ITEM_ELEVATOR_SHAFT:   return "Standard";
+    case ITEM_ELEVATOR_SERVICE: return "Service";
+    case ITEM_ELEVATOR_EXPRESS: return "Express";
+    case ITEM_OFFICE:           return "Office";
+    case ITEM_CONDO:            return "Condo";
+    case ITEM_HOTEL_SINGLE:     return "Single";
+    case ITEM_HOTEL_TWIN:       return "Twin";
+    case ITEM_HOTEL_SUITE:      return "Suite";
+    case ITEM_HOUSEKEEPING:     return "Housekeeping";
+    case ITEM_FAST_FOOD:        return "Fast Food";
+    case ITEM_RESTAURANT:       return "Restaurant";
+    case ITEM_SHOP:             return "Shop";
+    case ITEM_CINEMA:           return "Cinema";
+    case ITEM_PARTY_HALL:       return "Party Hall";
+    case ITEM_SECURITY:         return "Security";
+    case ITEM_MEDICAL:          return "Medical";
+    case ITEM_RECYCLING:        return "Recycling";
+    case ITEM_RAMP:             return "Ramp";
+    case ITEM_PARKING:          return "Parking";
+    case ITEM_METRO:            return "Metro";
+    case ITEM_CATHEDRAL:        return "Cathedral";
+    default:                    return tower_item_name((ItemType)item);
+    }
+}
+
+/* Cell in the toolbox icon strip (the same authoritative indices as
+ * tool_buttons[]), or -1. */
+static int dock_item_icon(int item)
+{
+    switch (item) {
+    case ITEM_LOBBY: return 0;            case ITEM_FLOOR: return 1;
+    case ITEM_STAIRS: return 2;           case ITEM_ESCALATOR: return 3;
+    case ITEM_ELEVATOR_SHAFT: return 4;   case ITEM_ELEVATOR_SERVICE: return 5;
+    case ITEM_ELEVATOR_EXPRESS: return 6; case ITEM_OFFICE: return 7;
+    case ITEM_HOTEL_SINGLE: return 8;     case ITEM_HOTEL_TWIN: return 9;
+    case ITEM_HOTEL_SUITE: return 10;     case ITEM_FAST_FOOD: return 11;
+    case ITEM_RESTAURANT: return 12;      case ITEM_SHOP: return 13;
+    case ITEM_CINEMA: return 14;          case ITEM_PARTY_HALL: return 15;
+    case ITEM_RAMP: return 16;            case ITEM_PARKING: return 17;
+    case ITEM_RECYCLING: return 18;       case ITEM_METRO: return 19;
+    case ITEM_CATHEDRAL: return 20;       case ITEM_MEDICAL: return 22;
+    case ITEM_HOUSEKEEPING: return 23;    case ITEM_CONDO: return 24;
+    case ITEM_SECURITY: return 25;
+    default: return -1;
+    }
+}
+
+/* Why a slot is greyed (locked, or the tower takes no more), or NULL. */
+static const char *dock_reason(int item)
+{
+    if (item < 0) return NULL;
+    return hints_unavailable(&game.sim, &game.tower, (ItemType)item);
+}
+
+static int dock_selected(int item)
+{
+    switch (item) {
+    case DOCK_INSPECT: return game.inspect_mode;
+    case DOCK_FINGER:  return game.finger_mode;
+    case DOCK_REMOVE:  return game.demolish_mode;
+    default:
+        return (int)game.build_type == item && !game.demolish_mode &&
+               !game.finger_mode && !game.inspect_mode;
+    }
+}
+
+static int dock_text_w(const char *s)
+{
+    int w = 0, h = 0;
+    if (game.font_small) TTF_SizeUTF8(game.font_small, s, &w, &h);
+    return w;
+}
+
+static void dock_layout(DockLayout *L)
+{
+    memset(L, 0, sizeof *L);
+    L->horizontal = game.narrow_layout;
+    if (L->horizontal)
+        L->view = (SDL_Rect){ 0, game.screen_h - DOCK_H, game.screen_w, DOCK_H };
+    else
+        L->view = (SDL_Rect){ 0, MENU_BAR_H, DOCK_W, game.screen_h - MENU_BAR_H };
+    int pos = DOCK_PAD;
+    for (int g = 0; g < DOCK_GROUP_COUNT; g++) {
+        const DockGroup *G = &DOCK_GROUPS[g];
+        if (L->horizontal) {
+            /* a group is a heading over one row; groups run left to right */
+            int x = pos;
+            for (int k = 0; k < G->n && L->n < DOCK_SLOTS_MAX; k++) {
+                int w = dock_text_w(dock_label(G->items[k])) + 14;
+                if (w < 58) w = 58;
+                L->item[L->n] = G->items[k];
+                L->r[L->n++] = (SDL_Rect){ x, DOCK_PAD + DOCK_HEAD_H, w, DOCK_BTN_H };
+                x += w + DOCK_GAP;
+            }
+            x -= DOCK_GAP;
+            int hw = dock_text_w(G->title);
+            if (x - pos < hw) x = pos + hw;
+            L->head[g] = (SDL_Rect){ pos, DOCK_PAD, x - pos, DOCK_HEAD_H };
+            pos = x + 2 * DOCK_GROUP_GAP;
+        } else {
+            /* a heading, then one full-width button per row */
+            int w = DOCK_W - 2 * DOCK_PAD;
+            L->head[g] = (SDL_Rect){ DOCK_PAD, pos, w, DOCK_HEAD_H };
+            pos += DOCK_HEAD_H;
+            for (int k = 0; k < G->n && L->n < DOCK_SLOTS_MAX; k++) {
+                L->item[L->n] = G->items[k];
+                L->r[L->n++] = (SDL_Rect){ DOCK_PAD, pos, w, DOCK_BTN_H };
+                pos += DOCK_BTN_H + DOCK_GAP;
+            }
+            pos += DOCK_GROUP_GAP - DOCK_GAP;
+        }
+    }
+    L->content = pos - (L->horizontal ? 2 * DOCK_GROUP_GAP : DOCK_GROUP_GAP)
+                 + DOCK_PAD;
+}
+
+static float dock_max_scroll(const DockLayout *L)
+{
+    int m = L->content - (L->horizontal ? L->view.w : L->view.h);
+    return m > 0 ? (float)m : 0.0f;
+}
+
+static void dock_clamp_scroll(const DockLayout *L)
+{
+    float m = dock_max_scroll(L);
+    if (game.dock_scroll > m) { game.dock_scroll = m; game.dock_vel = 0; }
+    if (game.dock_scroll < 0) { game.dock_scroll = 0; game.dock_vel = 0; }
+}
+
+/* A content rect (slot or heading) where it sits on screen right now. */
+static SDL_Rect dock_to_screen(const DockLayout *L, SDL_Rect r)
+{
+    int s = (int)(game.dock_scroll + 0.5f);
+    r.x += L->view.x - (L->horizontal ? s : 0);
+    r.y += L->view.y - (L->horizontal ? 0 : s);
+    return r;
+}
+
+static int dock_contains(int x, int y)
+{
+    if (!dock_active()) return 0;
+    DockLayout L;
+    dock_layout(&L);
+    return point_in_rect(x, y, L.view);
+}
+
+/* Slot under a screen point (only where the panel shows it), or -1. */
+static int dock_slot_at(const DockLayout *L, int x, int y)
+{
+    if (!point_in_rect(x, y, L->view)) return -1;
+    for (int i = 0; i < L->n; i++)
+        if (point_in_rect(x, y, dock_to_screen(L, L->r[i]))) return i;
+    return -1;
+}
+
+static void dock_select(int item)
+{
+    game.tool_popup = -1;
+    switch (item) {
+    case DOCK_REMOVE:
+        game.demolish_mode = !game.demolish_mode;
+        if (game.demolish_mode) game.finger_mode = game.inspect_mode = 0;
+        break;
+    case DOCK_FINGER:
+        game.finger_mode = !game.finger_mode;
+        game.demolish_mode = game.inspect_mode = 0;
+        if (game.finger_mode) game.build_type = ITEM_NONE;
+        break;
+    case DOCK_INSPECT:
+        game.inspect_mode = !game.inspect_mode;
+        game.demolish_mode = game.finger_mode = 0;
+        if (game.inspect_mode) game.build_type = ITEM_NONE;
+        break;
+    default: {
+        /* A greyed slot says why on the message line — a phone has no
+         * hover to show the tooltip (long-press does, too). */
+        const char *why = dock_reason(item);
+        if (why) {
+            char msg[HINT_LEN];
+            snprintf(msg, sizeof msg, "%s: %s", tower_item_name((ItemType)item), why);
+            add_event_message(msg);
+            return;
+        }
+        game.build_type = (ItemType)item;
+        game.demolish_mode = game.finger_mode = game.inspect_mode = 0;
+        printf("Build: %s\n", tower_item_name(game.build_type));
+        break;
+    }
+    }
+}
+
+static int dock_click(int x, int y)
+{
+    if (!dock_active()) return 0;
+    DockLayout L;
+    dock_layout(&L);
+    if (!point_in_rect(x, y, L.view)) return 0;
+    if (game.dock_dragging) return 1;
+    int i = dock_slot_at(&L, x, y);
+    if (i >= 0) dock_select(L.item[i]);
+    return 1;                            /* the panel swallows near-misses */
+}
+
+static void dock_wheel(const SDL_Event *ev)
+{
+    DockLayout L;
+    dock_layout(&L);
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+    float wx = ev->wheel.preciseX, wy = ev->wheel.preciseY;
+#else
+    float wx = (float)ev->wheel.x, wy = (float)ev->wheel.y;
+#endif
+    float d = L.horizontal ? (wx != 0 ? wx : -wy) : -wy;
+    game.dock_scroll += d * 40.0f;
+    game.dock_vel = 0;
+    dock_clamp_scroll(&L);
+}
+
+/* Touch drag-scroll (main.c's touch handlers route a drag that starts on
+ * the dock here instead of turning it into a mouse press). */
+static float dock_axis(int x, int y) { return game.narrow_layout ? (float)x : (float)y; }
+
+static void dock_drag_begin(int x, int y)
+{
+    game.dock_dragging = 1;
+    game.dock_drag_pos0 = game.dock_last_pos = dock_axis(x, y);
+    game.dock_scroll0 = game.dock_scroll;
+    game.dock_vel = 0;
+    game.dock_last_ms = SDL_GetTicks();
+}
+
+static void dock_drag_move(int x, int y)
+{
+    DockLayout L;
+    dock_layout(&L);
+    float p = dock_axis(x, y);
+    Uint32 now = SDL_GetTicks();
+    Uint32 dt = now - game.dock_last_ms;
+    if (dt > 0) {
+        float v = -(p - game.dock_last_pos) / (float)dt;
+        game.dock_vel = game.dock_vel * 0.3f + v * 0.7f;   /* smoothed */
+    }
+    game.dock_last_pos = p;
+    game.dock_last_ms = now;
+    game.dock_scroll = game.dock_scroll0 - (p - game.dock_drag_pos0);
+    dock_clamp_scroll(&L);
+}
+
+static void dock_drag_end(int fling)
+{
+    game.dock_dragging = 0;
+    /* a finger that stopped before lifting leaves no fling */
+    if (!fling || SDL_GetTicks() - game.dock_last_ms > 80) game.dock_vel = 0;
+}
+
+/* Hover/long-press text for the slot under (x, y); *anchor gets its
+ * on-screen rect so the tip can sit beside the dock, not under a thumb. */
+static int dock_tooltip(int x, int y, char lines[][HINT_LEN], int max,
+                        SDL_Rect *anchor)
+{
+    if (!dock_active()) return 0;
+    DockLayout L;
+    dock_layout(&L);
+    int i = dock_slot_at(&L, x, y);
+    if (i < 0) return 0;
+    *anchor = dock_to_screen(&L, L.r[i]);
+    static const char *tools[3][2] = {
+        { "Inspect", "Press a unit to see its tenants, their opinion and "
+                     "notes on what would help" },
+        { "Finger", "Open an elevator's controls, or drag a shaft's top or "
+                    "bottom to resize it" },
+        { "Remove", "Demolish a unit, stairs or a shaft. The lobby stays" },
+    };
+    int item = L.item[i];
+    if (item < 0) {
+        int t = -item - 1, n = 0;
+        if (max > 0) snprintf(lines[n++], HINT_LEN, "%s", tools[t][0]);
+        if (max > 1) snprintf(lines[n++], HINT_LEN, "%s", tools[t][1]);
+        return n;
+    }
+    return hints_tool(&game.sim, &game.tower, (ItemType)item, lines, max);
+}
+
+/* The fling left by a drag, slowing to a stop. */
+static void dock_animate(const DockLayout *L)
+{
+    static Uint32 last;
+    Uint32 now = SDL_GetTicks();
+    Uint32 dt = last ? now - last : 16;
+    last = now;
+    if (dt > 50) dt = 50;
+    if (!game.dock_dragging && game.dock_vel != 0) {
+        game.dock_scroll += game.dock_vel * (float)dt;
+        game.dock_vel *= powf(0.995f, (float)dt);
+        if (fabsf(game.dock_vel) < 0.02f) game.dock_vel = 0;
+    }
+    dock_clamp_scroll(L);
+}
+
+static void render_dock(void)
+{
+    DockLayout L;
+    dock_layout(&L);
+    dock_animate(&L);
+    SDL_Renderer *R = game.renderer;
+    /* The dock picks its own colours: the remap would lift the greyed
+     * labels back to full white. */
+    ui_remap_suspend();
+    SDL_SetRenderDrawBlendMode(R, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(R, 20, 24, 32, 240);
+    SDL_RenderFillRect(R, &L.view);
+    SDL_SetRenderDrawColor(R, UI.border.r, UI.border.g, UI.border.b, 60);
+    if (L.horizontal)
+        SDL_RenderDrawLine(R, L.view.x, L.view.y, L.view.x + L.view.w - 1, L.view.y);
+    else
+        SDL_RenderDrawLine(R, L.view.x + L.view.w - 1, L.view.y,
+                           L.view.x + L.view.w - 1, L.view.y + L.view.h - 1);
+
+    SDL_Rect old_clip;
+    int had_clip = SDL_RenderIsClipEnabled(R);
+    SDL_RenderGetClipRect(R, &old_clip);
+    SDL_RenderSetClipRect(R, &L.view);
+
+    for (int g = 0; g < DOCK_GROUP_COUNT; g++) {
+        SDL_Rect h = dock_to_screen(&L, L.head[g]);
+        ui_text_at(game.font_small, DOCK_GROUPS[g].title, UI.text_dim,
+                   h.x + 2, h.y + 2, 0, 0);
+    }
+    int hover = (!game.last_input_touch && !game.dock_dragging)
+                    ? dock_slot_at(&L, game.mouse_x, game.mouse_y) : -1;
+    for (int i = 0; i < L.n; i++) {
+        SDL_Rect r = dock_to_screen(&L, L.r[i]);
+        if (!SDL_HasIntersection(&r, &L.view)) continue;
+        int item = L.item[i];
+        int locked = dock_reason(item) != NULL;
+        int sel = dock_selected(item);
+        ui_button(r, locked ? UI_BTN_OFF : (i == hover ? UI_BTN_HOT : UI_BTN_NORMAL));
+        if (sel) {               /* BrandyTower's ring: border + inset */
+            ui_stroke_round(r, 6, UI_ALL, UI.accent);
+            SDL_Rect in = { r.x + 1, r.y + 1, r.w - 2, r.h - 2 };
+            ui_stroke_round(in, 5, UI_ALL, UI.accent);
+        }
+        /* icon: 28px item art, or the 17px hand-tool glyph */
+        int icx = r.x + r.w / 2, icy = r.y + 4 + 14;
+        SDL_Texture *tex = NULL;
+        SDL_Rect src, dst;
+        if (item >= 0 && game.ui_items_modern && dock_item_icon(item) >= 0) {
+            tex = game.ui_items_modern;
+            src = (SDL_Rect){ dock_item_icon(item) * 32 + 2, 2, 28, 28 };
+            dst = (SDL_Rect){ icx - 14, icy - 14, 28, 28 };
+        } else if (item < 0 && game.ui_tools_modern) {
+            int t = item == DOCK_REMOVE ? 0 : item == DOCK_FINGER ? 1 : 2;
+            tex = game.ui_tools_modern;
+            src = (SDL_Rect){ t * 21 + 2, 2, 17, 17 };
+            dst = (SDL_Rect){ icx - 8, icy - 8, 17, 17 };
+        }
+        if (tex) {
+            SDL_SetTextureAlphaMod(tex, locked ? 70 : 255);
+            SDL_RenderCopy(R, tex, &src, &dst);
+            SDL_SetTextureAlphaMod(tex, 255);
+        }
+        const char *label = dock_label(item);
+        int tw = dock_text_w(label);
+        ui_text_at(game.font_small, label, locked ? UI.text_off : UI.text,
+                   r.x + (r.w - tw) / 2, r.y + r.h - 15, 0, r.w - 4);
+    }
+
+    /* a thin scroll thumb when there is more than fits */
+    float m = dock_max_scroll(&L);
+    if (m > 0) {
+        int len = L.horizontal ? L.view.w : L.view.h;
+        int thumb = len * len / L.content;
+        if (thumb < 24) thumb = 24;
+        int off = (int)((len - thumb) * (game.dock_scroll / m));
+        SDL_Rect t = L.horizontal
+            ? (SDL_Rect){ L.view.x + off, L.view.y + L.view.h - 4, thumb, 3 }
+            : (SDL_Rect){ L.view.x + L.view.w - 4, L.view.y + off, 3, thumb };
+        SDL_SetRenderDrawBlendMode(R, SDL_BLENDMODE_BLEND);
+        ui_fill_round(t, 1, UI_ALL, (SDL_Color){ 255, 255, 255, 70 });
+    }
+
+    SDL_RenderSetClipRect(R, had_clip ? &old_clip : NULL);
+    SDL_SetRenderDrawBlendMode(R, SDL_BLENDMODE_NONE);
+    ui_remap_resume();
+}
+
 static void render_toolbox(void)
 {
+    if (game.ui_modern) { render_dock(); return; }
     int wx = game.tool_x;
     int wy = game.tool_y;
-    
+
     /* Title bar for dragging */
     draw_win31_titlebar(wx, wy, TOOL_WIN_W, "Tools");
     wy += WIN_TITLEBAR_H;
@@ -9341,6 +9799,7 @@ static int speed_window_click(int mx, int my)
 /* ---------- Toolbox click helper ---------- */
 static int toolbox_click(int mx, int my)
 {
+    if (game.ui_modern) return dock_click(mx, my);
     if (!game.win_toolbar) return 0;
     int wx = game.tool_x;
     int wy = game.tool_y + WIN_TITLEBAR_H;  /* Skip title bar */
@@ -9468,8 +9927,8 @@ static int titlebar_hit_test(int mx, int my)
         return 2;
     }
 
-    /* Toolbox title bar */
-    if (game.win_toolbar &&
+    /* Toolbox title bar (the Modern UI dock has none) */
+    if (game.win_toolbar && !game.ui_modern &&
         mx >= game.tool_x && mx < game.tool_x + TOOL_WIN_W &&
         my >= game.tool_y && my < game.tool_y + WIN_TITLEBAR_H) {
         return 3;
@@ -9533,8 +9992,9 @@ static int point_in_any_window(int mx, int my)
         my >= game.map_y && my < game.map_y + MAP_WIN_H) {
         return 1;
     }
-    /* Toolbox */
-    if (game.win_toolbar &&
+    /* Toolbox, or the Modern UI dock in its place */
+    if (dock_contains(mx, my)) return 1;
+    if (game.win_toolbar && !game.ui_modern &&
         mx >= game.tool_x && mx < game.tool_x + TOOL_WIN_W &&
         my >= game.tool_y && my < game.tool_y + TOOL_WIN_H) {
         return 1;
@@ -10836,6 +11296,11 @@ static void handle_event(SDL_Event *ev)
             /* upper clamp happens in the renderer against the live shaft */
             break;
         }
+        /* Over the Modern UI dock: scroll the dock, not the tower. */
+        if (dock_contains(game.mouse_x, game.mouse_y)) {
+            dock_wheel(ev);
+            break;
+        }
         /* Ctrl/Cmd+wheel = zoom about the cursor (port addition; the web
          * shell turns trackpad pinches into ct_zoom_step calls itself). */
         if (SDL_GetModState() & (KMOD_CTRL | KMOD_GUI)) {
@@ -11042,7 +11507,9 @@ static int ui_owns_point(int x, int y)
         return 1;
     if (menu_bar_hit_test(x, y) >= 0) return 1;
     if (point_in_any_window(x, y)) return 1;
-    if (game.win_toolbar && x >= game.tool_x && x < game.tool_x + TOOL_WIN_W &&
+    if (dock_contains(x, y)) return 1;
+    if (game.win_toolbar && !game.ui_modern &&
+        x >= game.tool_x && x < game.tool_x + TOOL_WIN_W &&
         y >= game.tool_y && y < game.tool_y + tool_win_height())
         return 1;
     if (game.person_open && point_in_rect(x, y, person_popup_rect())) return 1;
@@ -11079,9 +11546,13 @@ static int cap_at(int floor, int cell)
 }
 
 /* ---- Placement confirm: a small Win3.1 box under the parked ghost ---- */
-#define PC_W     136
-#define PC_BTN   24
-#define PC_H     (WIN_TITLEBAR_H + 4 + PC_BTN + 4 + 22 + 6)
+/* Sized for a thumb: 44px nudge pads (Apple's minimum touch target) and
+ * Build / Cancel nearly as tall. */
+#define PC_BTN   44
+#define PC_GAP   6
+#define PC_W     (4 * PC_BTN + 5 * PC_GAP)
+#define PC_ROW2  32
+#define PC_H     (WIN_TITLEBAR_H + PC_GAP + PC_BTN + PC_GAP + PC_ROW2 + PC_GAP)
 
 static void place_confirm_origin(int *ox, int *oy)
 {
@@ -11096,7 +11567,8 @@ static void place_confirm_origin(int *ox, int *oy)
     gy = (int)(gy * game.zoom);
     int x = gx - PC_W / 2;
     int y = gy + (int)(CELL_H * game.zoom) + 8;          /* below the row */
-    if (y + PC_H > game.screen_h) y = gy - (int)(CELL_H * game.zoom) - PC_H - 8;
+    int bottom = game.screen_h - (dock_active() && game.narrow_layout ? DOCK_H : 0);
+    if (y + PC_H > bottom) y = gy - (int)(CELL_H * game.zoom) - PC_H - 8;
     clamp_win(&x, &y, PC_W, PC_H);
     *ox = x; *oy = y;
 }
@@ -11124,25 +11596,27 @@ static SDL_Rect place_confirm_button(int i)
 {
     int ox, oy;
     place_confirm_origin(&ox, &oy);
-    int ry = oy + WIN_TITLEBAR_H + 4;
-    if (i < 4) {
-        int gap = (PC_W - 4 * PC_BTN) / 5;
-        return (SDL_Rect){ ox + gap + i * (PC_BTN + gap), ry, PC_BTN, PC_BTN };
-    }
-    int bw = (PC_W - 18) / 2;
-    return (SDL_Rect){ ox + 6 + (i - 4) * (bw + 6), ry + PC_BTN + 4, bw, 22 };
+    int ry = oy + WIN_TITLEBAR_H + PC_GAP;
+    if (i < 4)
+        return (SDL_Rect){ ox + PC_GAP + i * (PC_BTN + PC_GAP), ry, PC_BTN, PC_BTN };
+    int bw = (PC_W - 3 * PC_GAP) / 2;
+    return (SDL_Rect){ ox + PC_GAP + (i - 4) * (bw + PC_GAP),
+                       ry + PC_BTN + PC_GAP, bw, PC_ROW2 };
 }
 
 static void draw_nudge_arrow(SDL_Rect r, int dir)   /* 0 L, 1 U, 2 D, 3 R */
 {
+    /* a solid triangle about half the pad: tip T px from the centre */
     int cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+    int T = r.w * 5 / 22;                 /* 10 on a 44px pad */
     SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
-    for (int k = 0; k <= 6; k++) {
+    for (int k = 0; k <= 2 * T; k++) {
+        int half = k * 3 / 4;             /* a little sharper than 45 degrees */
         switch (dir) {
-        case 0: SDL_RenderDrawLine(game.renderer, cx - 4 + k, cy - k, cx - 4 + k, cy + k); break;
-        case 3: SDL_RenderDrawLine(game.renderer, cx + 4 - k, cy - k, cx + 4 - k, cy + k); break;
-        case 1: SDL_RenderDrawLine(game.renderer, cx - k, cy - 4 + k, cx + k, cy - 4 + k); break;
-        default: SDL_RenderDrawLine(game.renderer, cx - k, cy + 4 - k, cx + k, cy + 4 - k); break;
+        case 0: SDL_RenderDrawLine(game.renderer, cx - T + k, cy - half, cx - T + k, cy + half); break;
+        case 3: SDL_RenderDrawLine(game.renderer, cx + T - k, cy - half, cx + T - k, cy + half); break;
+        case 1: SDL_RenderDrawLine(game.renderer, cx - half, cy - T + k, cx + half, cy - T + k); break;
+        default: SDL_RenderDrawLine(game.renderer, cx - half, cy + T - k, cx + half, cy + T - k); break;
         }
     }
 }
@@ -11252,16 +11726,26 @@ static int th_claims_drag(void *ctx, int x, int y)
 static void th_drag_start(void *ctx, int x, int y)
 {
     (void)ctx;
+    if (dock_contains(x, y)) {           /* slide the dock, keep the ghost */
+        dock_drag_begin(x, y);
+        return;
+    }
     game.place_pending = 0;
     synth_motion(x, y);
     synth_button(1, x, y);
 }
 
-static void th_drag_move(void *ctx, int x, int y) { (void)ctx; synth_motion(x, y); }
+static void th_drag_move(void *ctx, int x, int y)
+{
+    (void)ctx;
+    if (game.dock_dragging) { dock_drag_move(x, y); return; }
+    synth_motion(x, y);
+}
 
 static void th_drag_end(void *ctx, int x, int y)
 {
     (void)ctx;
+    if (game.dock_dragging) { dock_drag_move(x, y); dock_drag_end(1); return; }
     synth_motion(x, y);
     synth_button(0, x, y);
 }
@@ -11269,6 +11753,7 @@ static void th_drag_end(void *ctx, int x, int y)
 static void th_drag_cancel(void *ctx)
 {
     (void)ctx;
+    if (game.dock_dragging) { dock_drag_end(0); return; }
     /* A cap drag and a window drag were live all along: let them finish
      * where they are. A build drag is abandoned, not committed. */
     if (game.cap_drag || game.win_dragging) {
@@ -11436,7 +11921,7 @@ static int tooltip_content(int x, int y, int world,
             return n;
         }
     }
-    if (game.win_toolbar) {
+    if (game.win_toolbar && !game.ui_modern) {
         int wy = game.tool_y + WIN_TITLEBAR_H, speed_y = wy + 8;
         int tools_y = speed_y + 28;
         /* pull-down sub-items */
@@ -11608,9 +12093,14 @@ static void draw_hint_text(TTF_Font *font, const char *s, int x, int y)
     SDL_FreeSurface(ts);
 }
 
-/* A grey Win3.1 box of wrapped lines; first line bold as the heading. */
+/* A grey Win3.1 box of wrapped lines; first line bold as the heading.
+ * anchor: 0 = top-left at (x, y); 1 = below a cursor at (x, y);
+ * 2 = bottom-left at (x, y) (above the Modern UI's bottom dock). */
+#define HINT_AT     0
+#define HINT_BELOW  1
+#define HINT_ABOVE  2
 static void draw_hint_box(char in[][HINT_LEN], int nin, int x, int y,
-                          int anchor_below, int max_w)
+                          int anchor, int max_w)
 {
     TTF_Font *body = game.font_dlg ? game.font_dlg : game.font_small;
     char out[HINT_LINES * 3][HINT_LEN];
@@ -11619,7 +12109,9 @@ static void draw_hint_box(char in[][HINT_LEN], int nin, int x, int y,
     if (n <= 0) return;
     int lh = body ? TTF_FontLineSkip(body) : 14;
     int w = widest + 12, h = n * lh + 8;
+    int anchor_below = anchor == HINT_BELOW;
     if (anchor_below) { x += 14; y += 20; }
+    if (anchor == HINT_ABOVE) y -= h;
     if (x + w > game.screen_w - 2) x = game.screen_w - 2 - w;
     if (y + h > game.screen_h - 2) y = (anchor_below ? y - 28 : y) - h;
     if (x < 2) x = 2;
@@ -11652,14 +12144,27 @@ static void render_tooltip(void)
         if (game.last_input_touch || touch_active(&game.touch) ||
             game.dragging || game.cam_panning || game.win_dragging)
             return;
-        if (SDL_GetTicks() - game.tip_moved_ms < TIP_DELAY_MS) return;
         x = game.mouse_x; y = game.mouse_y;
+        Uint32 delay = dock_contains(x, y) ? DOCK_TIP_MS : TIP_DELAY_MS;
+        if (SDL_GetTicks() - game.tip_moved_ms < delay) return;
     }
     char lines[HINT_LINES][HINT_LEN];
-    int n = tooltip_content(x, y, world, lines, HINT_LINES);
-    if (n <= 0) return;
     int max_w = TIP_MAX_W < game.screen_w - 24 ? TIP_MAX_W : game.screen_w - 24;
-    draw_hint_box(lines, n, x, y, 1, max_w);
+    /* The Modern UI dock: beside the column, or above the bottom strip,
+     * so the tip never sits under the pointer or a thumb. */
+    SDL_Rect a;
+    int n = dock_tooltip(x, y, lines, HINT_LINES, &a);
+    if (n > 0) {
+        if (game.narrow_layout)
+            draw_hint_box(lines, n, a.x, a.y - DOCK_PAD - DOCK_HEAD_H - 6,
+                          HINT_ABOVE, max_w);
+        else
+            draw_hint_box(lines, n, DOCK_W + 6, a.y, HINT_AT, max_w);
+        return;
+    }
+    n = tooltip_content(x, y, world, lines, HINT_LINES);
+    if (n <= 0) return;
+    draw_hint_box(lines, n, x, y, HINT_BELOW, max_w);
 }
 
 /* ---- Notes docked under the tenant info dialog (advice.ts) ---- */
@@ -11721,9 +12226,15 @@ static void render_tenant_notes(void)
  * dragged keep their spot (clamped). */
 static void clamp_win(int *x, int *y, int w, int h)
 {
+    /* the Modern UI dock owns its edge: windows stay clear of it */
+    int left = 0, bottom = game.screen_h;
+    if (dock_active()) {
+        if (game.narrow_layout) bottom -= DOCK_H;
+        else left = DOCK_W;
+    }
     if (*x + w > game.screen_w) *x = game.screen_w - w;
-    if (*y + h > game.screen_h) *y = game.screen_h - h;
-    if (*x < 0) *x = 0;
+    if (*y + h > bottom) *y = bottom - h;
+    if (*x < left) *x = left;
     if (*y < MENU_BAR_H) *y = MENU_BAR_H;
 }
 
@@ -11731,8 +12242,11 @@ static void layout_windows(void)
 {
     int W = game.screen_w;
     int info_h = WIN_TITLEBAR_H + INFO_BAR_H;
-    /* Map and info bar can't share the top row below this width. */
-    int narrow = W < MAP_WIN_W + INFO_BAR_W + 8;
+    /* The Modern UI's side dock takes a column off the left. */
+    int dock_w = dock_active() ? DOCK_W : 0;
+    /* Map and info bar can't share the top row below this width (the
+     * Modern UI dock moves to the bottom edge there, too). */
+    int narrow = W < dock_w + MAP_WIN_W + INFO_BAR_W + 8;
     if (narrow && !game.narrow_layout)
         game.win_map = 0;        /* phones start without the minimap; the
                                   * Windows menu still shows it */
@@ -11745,7 +12259,7 @@ static void layout_windows(void)
         game.info_y = MENU_BAR_H;
     }
     if (!(game.win_moved & 2)) {
-        game.map_x = 0;
+        game.map_x = narrow ? 0 : dock_w;
         game.map_y = MENU_BAR_H;
         /* narrow but shown anyway: under the info bar, not behind it */
         if (narrow) game.map_y = MENU_BAR_H + info_h;
@@ -11817,10 +12331,10 @@ static void apply_pending_requests(void)
      * toolbox grows with the star rating, windows are shown/hidden from
      * the Windows menu, a load swaps the tower under us. */
     {
-        static int sig[8];
-        int now[8] = { game.screen_w, game.screen_h, tool_win_height(),
+        static int sig[9];
+        int now[9] = { game.screen_w, game.screen_h, tool_win_height(),
                        game.win_map, game.win_infobar, game.win_toolbar,
-                       game.win_moved, game.win_speed };
+                       game.win_moved, game.win_speed, game.ui_modern };
         if (memcmp(sig, now, sizeof now)) {
             memcpy(sig, now, sizeof now);
             layout_windows();
@@ -11862,6 +12376,27 @@ EMSCRIPTEN_KEEPALIVE const char *ct_view_state(void)
              game.screen_h, game.view_w, game.view_h, (long)game.tower.money,
              game.place_pending, (int)game.build_type, game.win_map,
              game.map_mode, game.ui_modern);
+    return buf;
+}
+
+/* Test probe (tests/web/probe_dock.js): the Modern UI dock's slots on
+ * screen right now, so a probe can press "Lobby" without reading pixels. */
+EMSCRIPTEN_KEEPALIVE const char *ct_dock_state(void)
+{
+    static char buf[4096];
+    DockLayout L;
+    dock_layout(&L);
+    int o = snprintf(buf, sizeof buf,
+                     "{\"active\":%d,\"horizontal\":%d,\"scroll\":%.1f,"
+                     "\"max\":%.1f,\"view\":[%d,%d,%d,%d],\"slots\":[",
+                     dock_active(), L.horizontal, game.dock_scroll,
+                     dock_max_scroll(&L), L.view.x, L.view.y, L.view.w, L.view.h);
+    for (int i = 0; i < L.n && o < (int)sizeof buf - 96; i++) {
+        SDL_Rect r = dock_to_screen(&L, L.r[i]);
+        o += snprintf(buf + o, sizeof buf - o, "%s{\"item\":%d,\"r\":[%d,%d,%d,%d]}",
+                      i ? "," : "", L.item[i], r.x, r.y, r.w, r.h);
+    }
+    snprintf(buf + o, sizeof buf - o, "]}");
     return buf;
 }
 

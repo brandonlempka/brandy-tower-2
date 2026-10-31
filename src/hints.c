@@ -96,6 +96,48 @@ static const char *purpose(ItemType type)
     }
 }
 
+/* What the thing does once it is built — the "what is this for" a new
+ * player needs before spending on it. */
+static const char *description(ItemType type)
+{
+    switch (type) {
+    case ITEM_LOBBY:            return "Where everyone enters the tower and changes between "
+                                       "stairs and elevators";
+    case ITEM_FLOOR:            return "Empty floor to build on later; people can walk across it";
+    case ITEM_STAIRS:           return "Links two floors on foot. Cheap, but people only walk "
+                                       "a few floors";
+    case ITEM_ESCALATOR:        return "Moves shoppers and diners between commercial floors";
+    case ITEM_ELEVATOR_SHAFT:   return "Carries people up and down its shaft. Add cars to cut "
+                                       "waits; long waits sour tenants";
+    case ITEM_ELEVATOR_SERVICE: return "A private lift for staff: housekeepers and guards";
+    case ITEM_ELEVATOR_EXPRESS: return "A big, fast car that only stops at the lobby floors "
+                                       "(every 15th)";
+    case ITEM_OFFICE:           return "Let to a company: workers commute in each weekday and "
+                                       "pay rent every quarter";
+    case ITEM_CONDO:            return "Sold to a family for one up-front payment. They live "
+                                       "here and commute out";
+    case ITEM_HOTEL_SINGLE:     return "One guest checks in each evening and pays for the night";
+    case ITEM_HOTEL_TWIN:       return "Two guests check in each evening and pay for the night";
+    case ITEM_HOTEL_SUITE:      return "Upscale room for guests who pay well for the night";
+    case ITEM_HOUSEKEEPING:     return "Housekeepers clean hotel rooms after guests check out";
+    case ITEM_FAST_FOOD:        return "Feeds workers and visitors through the day; earns from "
+                                       "each customer";
+    case ITEM_RESTAURANT:       return "Serves dinner in the evening; earns from each customer";
+    case ITEM_SHOP:             return "A retail store; earns from shoppers through the day";
+    case ITEM_CINEMA:           return "Shows a film to crowds from outside; earns per ticket";
+    case ITEM_PARTY_HALL:       return "Hosts parties that bring in guests and earn per event";
+    case ITEM_SECURITY:         return "Guards patrol the tower and answer fires and bomb threats";
+    case ITEM_MEDICAL:          return "Treats tenants who fall ill";
+    case ITEM_RECYCLING:        return "Handles the tower's trash; a truck collects it daily";
+    case ITEM_RAMP:             return "Lets cars down into a basement level";
+    case ITEM_PARKING:          return "A space for office workers and guests who drive. "
+                                       "Costs upkeep; earns nothing";
+    case ITEM_METRO:            return "A subway station that brings crowds of visitors";
+    case ITEM_CATHEDRAL:        return "The crowning landmark on top of the tower";
+    default:                    return NULL;
+    }
+}
+
 int hints_tool(const GameSim *sim, const Tower *tower, ItemType type,
                char lines[][HINT_LEN], int max)
 {
@@ -105,17 +147,28 @@ int hints_tool(const GameSim *sim, const Tower *tower, ItemType type,
     money(ITEM_COST[type], cost, sizeof cost);
     PUSHF("%s - %s%s", tower_item_name(type), cost,
           (type == ITEM_FLOOR || type == ITEM_LOBBY) ? " a segment" : "");
-    const char *why = hints_unavailable(sim, tower, type);
-    if (why) PUSHF("%s", why);
-    if (ITEM_UNDERGROUND_ONLY[type]) PUSHF("Underground only");
-    else if (type == ITEM_OFFICE || type == ITEM_CONDO ||
-             item_is_hotel_room(type))
-        PUSHF("Above ground only");
-    if (type == ITEM_METRO || type == ITEM_CATHEDRAL) PUSHF("One per tower");
-    const char *rule = placement_rule(type);
-    if (rule) PUSHF("%s", rule);
+    /* What it does, then what it takes. */
+    const char *does = description(type);
+    if (does) PUSHF("%s", does);
     const char *what = purpose(type);
     if (what) PUSHF("%s", what);
+    PUSHF("Requires:");
+    const char *why = hints_unavailable(sim, tower, type);
+    if (why) PUSHF("  %s", why);
+    else if (sim->mode == MODE_CAMPAIGN)
+        PUSHF("  %s rating (you have it)", rating_name(ITEM_STAR_REQ[type]));
+    if (ITEM_UNDERGROUND_ONLY[type]) PUSHF("  Underground only");
+    else if (type == ITEM_OFFICE || type == ITEM_CONDO ||
+             item_is_hotel_room(type))
+        PUSHF("  Above ground only");
+    if (type == ITEM_METRO || type == ITEM_CATHEDRAL) PUSHF("  One per tower");
+    if (type != ITEM_FLOOR && type != ITEM_LOBBY && !item_is_elevator(type)) {
+        int h = ITEM_HEIGHT[type];
+        PUSHF("  Room for it: %d cells wide, %d floor%s", ITEM_WIDTH[type], h,
+              h == 1 ? "" : "s");
+    }
+    const char *rule = placement_rule(type);
+    if (rule) PUSHF("  %s", rule);
     return n;
 }
 
