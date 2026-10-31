@@ -88,7 +88,8 @@ native assumptions are system font paths and /tmp screenshot paths.
 ## Queue — later ideas (explicitly deferred, not this stage)
 - Shareable towers: export/import as file first; maybe compressed-in-URL
   links later.
-- Touch/tablet controls.
+- ~~Touch/tablet controls.~~ Shipped 2026-10-31 (responsive canvas, gestures,
+  placement confirm, tooltips — README "Modern play").
 - Custom ConciliaTower intro/splash (the long-deferred slot — its
   natural home is the web landing page).
 - itch.io mirror at launch (discoverability, comments).

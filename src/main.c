@@ -25,6 +25,9 @@
 #include "audio.h"
 #include "sound_hook.h"
 #include "strings.h"
+#include "view.h"
+#include "touch.h"
+#include "hints.h"
 
 /* ---------- Window / display ---------- */
 #define WINDOW_W    960
@@ -422,8 +425,14 @@ typedef struct {
     /* Camera smoothing */
     float           cam_fx, cam_fy;
     
-    /* Zoom */
+    /* Zoom (view.h): the world pass renders into a virtual viewport of
+     * view_w x view_h world pixels, blitted at `zoom` screen px per world
+     * px. view_w/view_h equal screen_w/screen_h at 1x. */
     float           zoom;
+    int             zoom_idx;        /* index into VIEW_ZOOM_STEPS */
+    int             view_w, view_h;  /* virtual viewport, world pixels */
+    SDL_Texture    *world_tex;       /* world-pass target when zoom != 1 */
+    int             world_tex_w, world_tex_h;
     
     /* Cloud sprites (up to 4 different shapes + Santa Easter egg) */
     Sprite         *clouds[SPR_CLOUD_COUNT];
@@ -497,6 +506,28 @@ typedef struct {
 
     /* Window dragging state */
     int             win_dragging;    /* 0=none, 1=info, 2=map, 3=toolbox */
+    int             win_moved;       /* player-dragged: 1=info 2=map 4=toolbox;
+                                      * layout_windows leaves those in place */
+    int             narrow_layout;   /* last layout was phone-narrow */
+    int             px_scale;        /* native HiDPI: device px per logical px */
+    /* Requests from the web shell (ct_set_view / ct_zoom_step), applied at
+     * the top of the next frame so JS never re-enters SDL mid-ASYNCIFY. */
+    int             pending_view_w, pending_view_h;
+    int             pending_zoom, pending_zoom_x, pending_zoom_y;
+    /* Touch (touch.c). A tap with a build tool doesn't build at once — it
+     * parks the ghost and asks (Build / Cancel / nudge), BrandyTower's
+     * placement confirm; a drag builds straight away. */
+    TouchState      touch;
+    int             place_pending, place_floor, place_cell;
+    int             place_box_x, place_box_y;   /* box stays put while
+                                                 * nudging (-1 = re-place) */
+    int             last_input_touch;           /* hover tooltips are for
+                                                 * mice; touch long-presses */
+    int             touch_drag_btn;  /* synthesized left button is down */
+    /* Tooltips (hints.c): shown after the mouse rests TIP_DELAY_MS on a
+     * target, or pinned by a touch long-press / a press on the stars. */
+    unsigned        tip_moved_ms;
+    int             tip_pinned, tip_x, tip_y;
     int             win_drag_ox;     /* Mouse offset from window origin at drag start */
     int             win_drag_oy;
     
@@ -622,6 +653,9 @@ typedef struct {
 #define ACT_EXPORT_SAV    30   /* Game menu: portable web-save download */
 #define ACT_MANUAL        31   /* Help menu: original 1994 manual (archive.org)
                                   in a new tab (Jonah 2026-09-11) */
+#define ACT_ZOOM_IN       32   /* View menu (port addition): whole-step zoom */
+#define ACT_ZOOM_OUT      33
+#define ACT_ZOOM_RESET    34
 #define ACT_MASS_PRICING  29   /* Port tool (Jonah 2026-08-12): bulk rent-
                                   class changes; no EXE counterpart */
 
@@ -696,8 +730,12 @@ static const MenuItem menu_view[] = {
     { "Screenshot\tF12",   ITEM_NONE,  ACT_SCREENSHOT },
     { NULL, ITEM_NONE, ACT_NONE },
     { "Santa!\tF2",        ITEM_NONE,  ACT_SANTA },
+    { NULL, ITEM_NONE, ACT_NONE },
+    { "Zoom In\t]",        ITEM_NONE,  ACT_ZOOM_IN },
+    { "Zoom Out\t[",       ITEM_NONE,  ACT_ZOOM_OUT },
+    { "Actual Size\tZ",    ITEM_NONE,  ACT_ZOOM_RESET },
 };
-#define MENU_VIEW_COUNT 8
+#define MENU_VIEW_COUNT 12
 
 /* Game menu — save/load, mode (radio), quit. Every keyboard command has a
  * menu home (VNC clients often can't send function keys). */
@@ -778,9 +816,58 @@ static const TopMenu top_menus[] = {
  * the bar hit-test and the dropdown anchor all use it. They used to
  * disagree (8 vs 7 px/char) and the dropdowns drifted right by one pixel
  * per character of every label before them (Jonah, 2026-09-11). */
+/* Narrow screens (phones): the 1994 bar is ~724px at full padding. The
+ * padding shrinks to fit, and below that the three long labels take
+ * short forms, so the bar fits down to ~450 logical px. Wide screens
+ * keep the original spacing exactly. */
+static int menu_bar_natural_chars(int shortened)
+{
+    int n = 0;
+    for (int i = 0; i < TOP_MENU_COUNT; i++) {
+        const char *l = top_menus[i].label;
+        if (shortened && !strcmp(l, "Build Res.")) l = "Res.";
+        if (shortened && !strcmp(l, "Build Com.")) l = "Com.";
+        if (shortened && !strcmp(l, "Transport"))  l = "Trans.";
+        n += (int)strlen(l);
+    }
+    return n;
+}
+
+static int menu_bar_shortened(void)
+{
+    return 8 + menu_bar_natural_chars(0) * 7 + TOP_MENU_COUNT * 2 * 4
+           > game.screen_w;
+}
+
+static int menu_item_pad(void)
+{
+    int chars = menu_bar_natural_chars(menu_bar_shortened());
+    int pad = (game.screen_w - 8 - chars * 7) / (TOP_MENU_COUNT * 2);
+    return pad > MENU_ITEM_PAD ? MENU_ITEM_PAD : pad < 2 ? 2 : pad;
+}
+
+static const char *top_menu_label(int i)
+{
+    const char *l = top_menus[i].label;
+    if (menu_bar_shortened()) {
+        if (!strcmp(l, "Build Res.")) return "Res.";
+        if (!strcmp(l, "Build Com.")) return "Com.";
+        if (!strcmp(l, "Transport"))  return "Trans.";
+    }
+    return l;
+}
+
 static int top_menu_width(int i)
 {
-    return (int)strlen(top_menus[i].label) * 7 + MENU_ITEM_PAD * 2;
+    return (int)strlen(top_menu_label(i)) * 7 + menu_item_pad() * 2;
+}
+
+/* A dropdown is 180px wide; keep it on screen under a right-hand menu. */
+static int dropdown_x(int menu_x)
+{
+    int x = menu_x;
+    if (x + 180 > game.screen_w) x = game.screen_w - 180;
+    return x < 0 ? 0 : x;
 }
 
 /* Get pixel position of top menu item */
@@ -824,10 +911,21 @@ static const CloudPos CLOUD_POSITIONS[] = {
 
 /* ---------- Coordinate conversion ---------- */
 
+/* Recompute the virtual viewport after a zoom or window-size change. */
+static void update_view_size(void)
+{
+    game.zoom_idx = view_clamp_zoom_index(game.zoom_idx);
+    game.zoom = VIEW_ZOOM_STEPS[game.zoom_idx];
+    game.view_w = view_virtual_extent(game.screen_w, game.zoom);
+    game.view_h = view_virtual_extent(game.screen_h, game.zoom);
+}
+
+/* sx/sy here are VIRTUAL viewport pixels (== screen pixels at 1x). Input
+ * handlers holding real screen coordinates go through mouse_to_grid. */
 static void screen_to_grid(int sx, int sy, int *floor, int *cell)
 {
-    int world_x = sx + (int)game.cam_fx - game.screen_w / 2;
-    int world_y = sy + (int)game.cam_fy - game.screen_h / 2;
+    int world_x = sx + (int)game.cam_fx - game.view_w / 2;
+    int world_y = sy + (int)game.cam_fy - game.view_h / 2;
 
     /* True floor-division by CELL_H. Plain integer division truncates toward
      * zero, which picks the wrong floor (off by one) above ground where
@@ -847,8 +945,18 @@ static void grid_to_screen(int floor, int cell, int *sx, int *sy)
     int world_x = cell * CELL_W;
     int world_y = -floor * CELL_H;
 
-    *sx = world_x - (int)game.cam_fx + game.screen_w / 2;
-    *sy = world_y - (int)game.cam_fy + game.screen_h / 2;
+    *sx = world_x - (int)game.cam_fx + game.view_w / 2;
+    *sy = world_y - (int)game.cam_fy + game.view_h / 2;
+}
+
+/* Real screen pixel -> virtual viewport pixel. */
+static int scr_to_vx(int sx) { return view_screen_to_virtual(sx, game.zoom); }
+static int scr_to_vy(int sy) { return view_screen_to_virtual(sy, game.zoom); }
+
+/* Real screen coordinates (mouse/touch) -> grid. */
+static void mouse_to_grid(int sx, int sy, int *floor, int *cell)
+{
+    screen_to_grid(scr_to_vx(sx), scr_to_vy(sy), floor, cell);
 }
 
 /* Shared ambient occupancy gate (ambient-gates referee 2026-08-09, SoundT
@@ -906,8 +1014,8 @@ static void ambient_tick(void)
 
     int sel = rand() % 6;                     /* probe: {mid,¾-down} × {¼,½,¾} */
     int frac = sel % 3;                       /* 0,1,2 -> ¼,½,¾ */
-    int sx = game.screen_w * (frac + 1) / 4;
-    int sy = (sel < 3) ? game.screen_h / 2 : game.screen_h * 3 / 4;
+    int sx = game.view_w * (frac + 1) / 4;
+    int sy = (sel < 3) ? game.view_h / 2 : game.view_h * 3 / 4;
 
     int floor, cell;
     screen_to_grid(sx, sy, &floor, &cell);
@@ -962,7 +1070,7 @@ static void ambient_tick(void)
  * the deepest basement, or absurdly far above the build ceiling. */
 static void clamp_camera(void)
 {
-    float half = game.screen_h / 2.0f;
+    float half = game.view_h / 2.0f;
     /* Bottom: one row PAST B10's lower edge — pit machinery draws a row
      * below a shaft's last segment, and a legacy B10-reaching shaft
      * (possible before the B9 extend gate, 2026-08-12) needs its pit
@@ -975,12 +1083,64 @@ static void clamp_camera(void)
     if (game.cam_fy < top)    game.cam_fy = top;
 
     /* Horizontal: keep at least part of the tower's width on screen. */
-    float halfw = game.screen_w / 2.0f;
+    float halfw = game.view_w / 2.0f;
     float right = (float)(TOWER_WIDTH * CELL_W) - halfw;
     float left  = halfw;
     if (left > right) left = right;
     if (game.cam_fx > right) game.cam_fx = right;
     if (game.cam_fx < left)  game.cam_fx = left;
+}
+
+/* Set the zoom step, keeping the world point under screen (sx, sy) fixed
+ * (BrandyTower camera.ts zoomTo). Cancels any camera glide. */
+static void zoom_set(int idx, int sx, int sy)
+{
+    idx = view_clamp_zoom_index(idx);
+    if (idx == game.zoom_idx) return;
+    float nx, ny;
+    view_zoom_about(game.cam_fx, game.cam_fy, game.screen_w, game.screen_h,
+                    game.zoom, VIEW_ZOOM_STEPS[idx], sx, sy, &nx, &ny);
+    game.zoom_idx = idx;
+    update_view_size();
+    game.cam_fx = nx;
+    game.cam_fy = ny;
+    game.cam_anim = 0;
+    clamp_camera();
+}
+
+static void zoom_step(int dir, int sx, int sy)
+{
+    zoom_set(game.zoom_idx + (dir > 0 ? 1 : -1), sx, sy);
+}
+
+static void zoom_step_center(int dir)
+{
+    zoom_step(dir, game.screen_w / 2, game.screen_h / 2);
+}
+
+static void update_px_scale(void);            /* responsive layout, below */
+static void touch_event(const SDL_Event *ev); /* touch input, below */
+static void clamp_win(int *x, int *y, int w, int h);
+static void render_place_confirm(void);
+static void render_tooltip(void);
+static void render_tenant_notes(void);
+static void tooltip_input(const SDL_Event *ev);
+static int  notes_panel_rect(SDL_Rect *r);
+static void apply_view_size(int w, int h);
+
+/* Read the presented frame into a new surface sized to the renderer's
+ * OUTPUT (device pixels — larger than screen_w x screen_h on a HiDPI
+ * display), so the readback can never overrun the buffer. */
+static SDL_Surface *read_screen_surface(void)
+{
+    int ow = game.screen_w, oh = game.screen_h;
+    SDL_GetRendererOutputSize(game.renderer, &ow, &oh);
+    SDL_Surface *sshot = SDL_CreateRGBSurface(0, ow, oh, 32,
+        0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
+    if (sshot)
+        SDL_RenderReadPixels(game.renderer, NULL, SDL_PIXELFORMAT_ARGB8888,
+                             sshot->pixels, sshot->pitch);
+    return sshot;
 }
 
 /* ---------- HUD text rendering helpers ---------- */
@@ -1180,8 +1340,11 @@ static void render_sky(void)
         } else {
             santa_fx += (truex - santa_fx) * 0.35f;
         }
+        /* The sim launches him at a fixed 960+100 (screen-space, the
+         * original's window); on a wider view anchor that to the right
+         * edge so he still enters from off-screen. */
         SDL_Rect dst = {
-            (int)lroundf(santa_fx),
+            (int)lroundf(santa_fx) + (game.view_w - WINDOW_W),
             lobby_sy + CELL_H - 0x84c + game.sim.santa.y,
             game.santa->w, game.santa->h
         };
@@ -4907,7 +5070,8 @@ static void render_minimap(void)
      * santa.x is screen-space, so convert to world; his altitude is the
      * fixed 0x84c px above ground minus the descent. */
     if (game.sim.santa.active) {
-        int wx_px = game.sim.santa.x + (int)game.cam_fx - game.screen_w / 2
+        int wx_px = game.sim.santa.x + (game.view_w - WINDOW_W)
+                    + (int)game.cam_fx - game.view_w / 2
                     + (game.santa ? game.santa->w / 2 : 0);
         int cell = wx_px / CELL_W;
         if (cell >= 0 && cell < TOWER_WIDTH) {
@@ -4984,8 +5148,8 @@ static void render_minimap(void)
     /* Camera viewport indicator — tracks BOTH axes of the view */
     {
         int cam_floor_top, cam_floor_bot, cam_xl, cam_xr;
-        screen_to_grid(0, HUD_HEIGHT + MENU_BAR_H, &cam_floor_top, &cam_xl);
-        screen_to_grid(game.screen_w, game.screen_h, &cam_floor_bot, &cam_xr);
+        mouse_to_grid(0, HUD_HEIGHT + MENU_BAR_H, &cam_floor_top, &cam_xl);
+        mouse_to_grid(game.screen_w, game.screen_h, &cam_floor_bot, &cam_xr);
 
         int vt = (int)(ground_line - (cam_floor_top + 1) * pf);
         int vb = (int)(ground_line - cam_floor_bot * pf);
@@ -5446,15 +5610,15 @@ static void render_menu_bar(void)
             SDL_SetRenderDrawColor(game.renderer, WIN31_SEL_BG, 255);
             SDL_Rect sel = { cx, bar_y + 1, tw, MENU_BAR_H - 2 };
             SDL_RenderFillRect(game.renderer, &sel);
-            draw_menu_text(top_menus[i].label, cx + MENU_ITEM_PAD, bar_y + 3, 1);
+            draw_menu_text(top_menu_label(i), cx + menu_item_pad(), bar_y + 3, 1);
         } else if (is_hover) {
             /* Slight highlight on hover */
             SDL_SetRenderDrawColor(game.renderer, 220, 220, 220, 255);
             SDL_Rect hl = { cx, bar_y + 1, tw, MENU_BAR_H - 2 };
             SDL_RenderFillRect(game.renderer, &hl);
-            draw_menu_text(top_menus[i].label, cx + MENU_ITEM_PAD, bar_y + 3, 0);
+            draw_menu_text(top_menu_label(i), cx + menu_item_pad(), bar_y + 3, 0);
         } else {
-            draw_menu_text(top_menus[i].label, cx + MENU_ITEM_PAD, bar_y + 3, 0);
+            draw_menu_text(top_menu_label(i), cx + menu_item_pad(), bar_y + 3, 0);
         }
         cx += tw;
     }
@@ -5470,7 +5634,7 @@ static void render_dropdown(void)
     int mx, my, mw, mh;
     get_top_menu_rect(game.menu_open, &mx, &my, &mw, &mh);
     
-    int drop_x = mx;
+    int drop_x = dropdown_x(mx);
     int drop_y = my + MENU_BAR_H;
     int drop_w = 180;
     int item_h = 18;
@@ -7227,12 +7391,15 @@ static void draw_tenant_picture(const Tenant *t, SDL_Rect box)
     if (tgt) {
         SDL_SetRenderTarget(game.renderer, tgt);
         float sx = game.cam_fx, sy = game.cam_fy;
+        int svw = game.view_w, svh = game.view_h;   /* picture is 1x */
+        game.view_w = game.screen_w; game.view_h = game.screen_h;
         game.cam_fx = (float)(wx0 + game.screen_w / 2);
         game.cam_fy = (float)(wy0 + game.screen_h / 2);
         render_sky();
         render_tower();
         render_people();
         game.cam_fx = sx; game.cam_fy = sy;
+        game.view_w = svw; game.view_h = svh;
         SDL_SetRenderTarget(game.renderer, NULL);
     }
 
@@ -8027,6 +8194,10 @@ static int movie_chooser_click(int mx, int my)
 static int inspect_popup_click(int mx, int my)
 {
     if (!game.inspect_open) return 0;
+    {   /* the docked Notes panel is part of the dialog */
+        SDL_Rect nr;
+        if (notes_panel_rect(&nr) && point_in_rect(mx, my, nr)) return 1;
+    }
     Tenant *t = tower_tenant(&game.tower, game.inspect_tid);
     if (!t) { game.inspect_open = 0; return 0; }
     TiLayout L; ti_build(t, &L);
@@ -8261,6 +8432,42 @@ static void render(void)
     SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
     SDL_RenderClear(game.renderer);
 
+    /* World pass. At 1x it draws straight to the screen (the faithful
+     * path, untouched). Zoomed, it draws into a view_w x view_h target
+     * with screen_w/h temporarily set to the virtual size — every world
+     * renderer sizes itself off them — and is then blitted whole-pixel
+     * (nearest) onto the screen. UI windows below always draw at 1x. */
+    if (game.place_pending) {       /* touch: the ghost stays where parked */
+        game.mouse_floor = game.place_floor;
+        game.mouse_cell = game.place_cell;
+    }
+    int zoomed = game.zoom_idx != VIEW_ZOOM_DEFAULT;
+    int real_w = game.screen_w, real_h = game.screen_h;
+    if (zoomed) {
+        if (!game.world_tex || game.world_tex_w != game.view_w ||
+            game.world_tex_h != game.view_h) {
+            if (game.world_tex) SDL_DestroyTexture(game.world_tex);
+            game.world_tex = SDL_CreateTexture(game.renderer,
+                SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET,
+                game.view_w, game.view_h);
+            game.world_tex_w = game.view_w;
+            game.world_tex_h = game.view_h;
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+            if (game.world_tex)
+                SDL_SetTextureScaleMode(game.world_tex, SDL_ScaleModeNearest);
+#endif
+        }
+        if (game.world_tex) {
+            SDL_SetRenderTarget(game.renderer, game.world_tex);
+            SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
+            SDL_RenderClear(game.renderer);
+            game.screen_w = game.view_w;
+            game.screen_h = game.view_h;
+        } else {
+            zoomed = 0;   /* no target support: fall back to 1x drawing */
+        }
+    }
+
     render_sky();
     if (game.elv_edit_mode) {
         render_elv_edit_mode();   /* silhouette tower + isolated shaft */
@@ -8290,6 +8497,14 @@ static void render(void)
         render_crane();
         render_build_ghost();
     }
+    if (zoomed) {
+        game.screen_w = real_w;
+        game.screen_h = real_h;
+        SDL_SetRenderTarget(game.renderer, NULL);
+        SDL_Rect dst = { 0, 0, (int)(game.view_w * game.zoom),
+                         (int)(game.view_h * game.zoom) };
+        SDL_RenderCopy(game.renderer, game.world_tex, NULL, &dst);
+    }
     render_ui();
     render_stats_window();
     render_tuning_window();
@@ -8297,17 +8512,20 @@ static void render(void)
     render_elv_dialog();
     render_fin_dialog();
     render_inspect_popup();
+    render_tenant_notes();    /* "why / how to fix" docked under it */
     render_person_popup();
     render_movie_chooser();   /* sub-dialogs draw on top of the info popup */
     render_name_editor();
     render_event_alert();
     render_find_dialog();      /* modal: above the popups */
+    render_place_confirm();    /* touch placement: Build / Cancel / nudge */
     render_menu_bar();         /* Win3.1 top bar + its open dropdown */
     render_dropdown();
     render_disaster_modal();   /* on top of everything — it's modal */
     render_notice_modal();     /* resolution/VIP notices, same layer */
     render_route_confirm();    /* likewise */
     render_quit_confirm();     /* topmost — quitting outranks all */
+    render_tooltip();          /* hints sit over everything they explain */
 
     SDL_RenderPresent(game.renderer);
 }
@@ -8776,7 +8994,7 @@ static int dropdown_hit_test(int mx, int my)
     
     int dx, dy, dw, dh;
     get_top_menu_rect(game.menu_open, &dx, &dy, &dw, &dh);
-    int drop_x = dx;
+    int drop_x = dropdown_x(dx);
     int drop_y = dy + MENU_BAR_H;
     int drop_w = 180;
     int item_h = 18;
@@ -8892,7 +9110,14 @@ static void execute_menu_item(const MenuItem *item)
 {
     if (item->build_type != ITEM_NONE) {
         if (!item_unlocked(item->build_type)) {   /* locked in Campaign */
-            add_event_message("Locked — raise your star rating first.");
+            /* say WHICH rating unlocks it (hints.c), not just "locked" */
+            const char *why = hints_unavailable(&game.sim, &game.tower,
+                                                item->build_type);
+            char msg[EVENT_MSG_LEN];
+            snprintf(msg, sizeof msg, "%s: %s",
+                     tower_item_name(item->build_type),
+                     why ? why : "raise your star rating first");
+            add_event_message(msg);
             game.menu_open = -1;
             return;
         }
@@ -8910,11 +9135,8 @@ static void execute_menu_item(const MenuItem *item)
     case ACT_SPEED_3:     game.sim.speed = SPEED_TURBO;   break;
     case ACT_DEBUG_TOGGLE: game.show_debug = !game.show_debug; break;
     case ACT_SCREENSHOT: {
-        SDL_Surface *sshot = SDL_CreateRGBSurface(0, game.screen_w, game.screen_h, 32,
-            0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
-        SDL_RenderReadPixels(game.renderer, NULL, SDL_PIXELFORMAT_ARGB8888,
-                             sshot->pixels, sshot->pitch);
-        SDL_SaveBMP(sshot, "/tmp/simtower_screenshot.bmp");
+        SDL_Surface *sshot = read_screen_surface();
+        if (sshot) SDL_SaveBMP(sshot, "/tmp/simtower_screenshot.bmp");
         SDL_FreeSurface(sshot);
         printf("Screenshot saved\n");
         break;
@@ -8955,8 +9177,12 @@ static void execute_menu_item(const MenuItem *item)
     case ACT_STATS:  game.show_stats  = !game.show_stats;  break;
     case ACT_TUNING: game.show_tuning = !game.show_tuning; break;
     case ACT_SANTA:
-        if (!game.sim.santa.active) game_launch_santa(&game.sim, game.screen_w);
+        if (!game.sim.santa.active) game_launch_santa(&game.sim, WINDOW_W);
         break;
+    case ACT_ZOOM_IN:    zoom_step_center(+1); break;
+    case ACT_ZOOM_OUT:   zoom_step_center(-1); break;
+    case ACT_ZOOM_RESET: zoom_set(VIEW_ZOOM_DEFAULT, game.screen_w / 2,
+                                  game.screen_h / 2); break;
     case ACT_WIN_TOOLBAR:  game.win_toolbar ^= 1; break;
     case ACT_WIN_INFOBAR:  game.win_infobar ^= 1; break;
     case ACT_WIN_MAP:      game.win_map ^= 1;     break;
@@ -9101,6 +9327,8 @@ static void cap_drag_track(void)
 /* ---------- Input handling ---------- */
 static void handle_event(SDL_Event *ev)
 {
+    tooltip_input(ev);       /* hide/pin tooltips; never consumes the event */
+
     /* Quit save-prompt: fully modal, topmost. */
     if (game.quit_confirm) {
         switch (ev->type) {
@@ -9252,8 +9480,18 @@ static void handle_event(SDL_Event *ev)
                 game.sim.speed = SPEED_PAUSED;
             printf("Speed: %s\n", game.sim.speed == SPEED_PAUSED ? "PAUSED" : "NORMAL");
             break;
+        case SDLK_RIGHTBRACKET: zoom_step(+1, game.mouse_x, game.mouse_y); break;
+        case SDLK_LEFTBRACKET:  zoom_step(-1, game.mouse_x, game.mouse_y); break;
+        case SDLK_z:
+            zoom_set(VIEW_ZOOM_DEFAULT, game.mouse_x, game.mouse_y);
+            break;
         case SDLK_EQUALS:
         case SDLK_PLUS:
+            /* Ctrl/Cmd +: browser-style zoom in (port addition) */
+            if (SDL_GetModState() & (KMOD_CTRL | KMOD_GUI)) {
+                zoom_step_center(+1);
+                break;
+            }
             /* UI cap is FAST (era-hardware approximation); TURBO is
              * mod/debug territory. */
             if (game.sim.speed < SPEED_FAST) {
@@ -9262,6 +9500,10 @@ static void handle_event(SDL_Event *ev)
             }
             break;
         case SDLK_MINUS:
+            if (SDL_GetModState() & (KMOD_CTRL | KMOD_GUI)) {
+                zoom_step_center(-1);
+                break;
+            }
             if (game.sim.speed > SPEED_PAUSED) {
                 game.sim.speed--;
                 printf("Speed: %d\n", game.sim.speed);
@@ -9271,7 +9513,7 @@ static void handle_event(SDL_Event *ev)
         /* Santa! */
         case SDLK_F2:
             if (!game.sim.santa.active) {
-                game_launch_santa(&game.sim, game.screen_w);
+                game_launch_santa(&game.sim, WINDOW_W);
             }
             break;
 
@@ -9327,11 +9569,8 @@ static void handle_event(SDL_Event *ev)
         
         /* Screenshot */
         case SDLK_F12: {
-            SDL_Surface *sshot = SDL_CreateRGBSurface(0, game.screen_w, game.screen_h, 32,
-                0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
-            SDL_RenderReadPixels(game.renderer, NULL, SDL_PIXELFORMAT_ARGB8888,
-                                 sshot->pixels, sshot->pitch);
-            SDL_SaveBMP(sshot, "/tmp/simtower_screenshot.bmp");
+            SDL_Surface *sshot = read_screen_surface();
+            if (sshot) SDL_SaveBMP(sshot, "/tmp/simtower_screenshot.bmp");
             SDL_FreeSurface(sshot);
             printf("Screenshot saved to /tmp/simtower_screenshot.bmp\n");
             break;
@@ -9340,15 +9579,15 @@ static void handle_event(SDL_Event *ev)
         /* Camera movement */
         /* Arrow keys = the original's scrollbar line steps (16px both
          * axes); PgUp/PgDn = its page steps (view minus one line). */
-        case SDLK_LEFT:  game.cam_fx -= 16; game.cam_anim = 0; break;
-        case SDLK_RIGHT: game.cam_fx += 16; game.cam_anim = 0; break;
-        case SDLK_UP:    game.cam_fy -= 16; game.cam_anim = 0; break;
-        case SDLK_DOWN:  game.cam_fy += 16; game.cam_anim = 0; break;
+        case SDLK_LEFT:  game.cam_fx -= 16 / game.zoom; game.cam_anim = 0; break;
+        case SDLK_RIGHT: game.cam_fx += 16 / game.zoom; game.cam_anim = 0; break;
+        case SDLK_UP:    game.cam_fy -= 16 / game.zoom; game.cam_anim = 0; break;
+        case SDLK_DOWN:  game.cam_fy += 16 / game.zoom; game.cam_anim = 0; break;
         case SDLK_PAGEUP:
-            game.cam_fy -= game.screen_h - MENU_BAR_H - 16;
+            game.cam_fy -= (game.screen_h - MENU_BAR_H - 16) / game.zoom;
             game.cam_anim = 0; break;
         case SDLK_PAGEDOWN:
-            game.cam_fy += game.screen_h - MENU_BAR_H - 16;
+            game.cam_fy += (game.screen_h - MENU_BAR_H - 16) / game.zoom;
             game.cam_anim = 0; break;
         
         /* Direct build type selection */
@@ -9401,16 +9640,16 @@ static void handle_event(SDL_Event *ev)
     case SDL_MOUSEMOTION:
         game.mouse_x = ev->motion.x;
         game.mouse_y = ev->motion.y;
-        screen_to_grid(game.mouse_x, game.mouse_y,
-                       &game.mouse_floor, &game.mouse_cell);
+        mouse_to_grid(game.mouse_x, game.mouse_y,
+                      &game.mouse_floor, &game.mouse_cell);
         cap_drag_track();   /* live shaft extension follows the cursor */
 
         /* Camera panning (middle/right-click drag) */
         if (game.cam_panning) {
             int dx = ev->motion.x - game.cam_pan_last_x;
             int dy = ev->motion.y - game.cam_pan_last_y;
-            game.cam_fx -= dx;
-            game.cam_fy -= dy;
+            game.cam_fx -= dx / game.zoom;
+            game.cam_fy -= dy / game.zoom;
             game.cam_anim = 0;
             game.cam_pan_last_x = ev->motion.x;
             game.cam_pan_last_y = ev->motion.y;
@@ -9430,6 +9669,7 @@ static void handle_event(SDL_Event *ev)
                 if (ny + INFO_BAR_H > game.screen_h) ny = game.screen_h - INFO_BAR_H;
                 game.info_x = nx;
                 game.info_y = ny;
+                game.win_moved |= 1;
                 break;
             case 2: /* Minimap */
                 if (nx < 0) nx = 0;
@@ -9438,6 +9678,7 @@ static void handle_event(SDL_Event *ev)
                 if (ny + MAP_WIN_H > game.screen_h) ny = game.screen_h - MAP_WIN_H;
                 game.map_x = nx;
                 game.map_y = ny;
+                game.win_moved |= 2;
                 break;
             case 3: /* Toolbox */
                 if (nx < 0) nx = 0;
@@ -9446,6 +9687,7 @@ static void handle_event(SDL_Event *ev)
                 if (ny + TOOL_WIN_H > game.screen_h) ny = game.screen_h - TOOL_WIN_H;
                 game.tool_x = nx;
                 game.tool_y = ny;
+                game.win_moved |= 4;
                 break;
             case 4: /* Elevator dialog */
                 if (nx < 0) nx = 0;
@@ -9658,7 +9900,8 @@ static void handle_event(SDL_Event *ev)
                     }
                 }
                 {
-                    uint16_t pid = person_hit_test(ev->button.x, ev->button.y);
+                    uint16_t pid = person_hit_test(scr_to_vx(ev->button.x),
+                                                   scr_to_vy(ev->button.y));
                     if (pid) {
                         open_person_popup_at(pid, ev->button.x, ev->button.y);
                         break;
@@ -9838,25 +10081,42 @@ static void handle_event(SDL_Event *ev)
             /* upper clamp happens in the renderer against the live shaft */
             break;
         }
+        /* Ctrl/Cmd+wheel = zoom about the cursor (port addition; the web
+         * shell turns trackpad pinches into ct_zoom_step calls itself). */
+        if (SDL_GetModState() & (KMOD_CTRL | KMOD_GUI)) {
+            if (ev->wheel.y) {
+                int mx, my;
+                SDL_GetMouseState(&mx, &my);
+                zoom_step(ev->wheel.y > 0 ? +1 : -1, mx, my);
+            }
+            break;
+        }
         /* Shift+wheel or horizontal wheel = scroll left/right */
         int shift = (SDL_GetModState() & KMOD_SHIFT);
         if (shift || ev->wheel.x != 0) {
             int dx = ev->wheel.x ? ev->wheel.x : ev->wheel.y;
-            game.cam_fx += dx * 60;
+            game.cam_fx += dx * 60 / game.zoom;
         } else {
-            game.cam_fy -= ev->wheel.y * 60;
+            game.cam_fy -= ev->wheel.y * 60 / game.zoom;
         }
         game.cam_anim = 0;
         break;
     }
         
+    case SDL_FINGERDOWN:
+    case SDL_FINGERMOTION:
+    case SDL_FINGERUP:
+        touch_event(ev);
+        break;
+
     case SDL_WINDOWEVENT:
 #ifndef __EMSCRIPTEN__
         /* Web canvas is fixed 960x720 — browser-side CSS resize events
          * must never shrink the game's render size. */
         if (ev->window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-            game.screen_w = ev->window.data1;
-            game.screen_h = ev->window.data2;
+            int nw = ev->window.data1, nh = ev->window.data2;
+            update_px_scale();
+            apply_view_size(nw, nh);
         }
 #endif
         break;
@@ -9877,6 +10137,8 @@ static void init_fonts(void)
     const char *font_paths[] = {
         "/fonts/LiberationSans-Bold.ttf",
         "/fonts/LiberationSans-Regular.ttf",
+        "web/fonts/LiberationSans-Bold.ttf",   /* native, run from the repo
+                                                * (macOS ships no Liberation) */
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -9888,6 +10150,7 @@ static void init_fonts(void)
      * byte-exact DTMP label rects allow ("Length" clipped, 2026-08-23). */
     const char *dlg_paths[] = {
         "/fonts/LiberationSans-Regular.ttf",
+        "web/fonts/LiberationSans-Regular.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         NULL
@@ -9976,6 +10239,846 @@ static void snd_tally_dump(void)
 /* Headless capture mode: when CT_SOUND_CAPTURE=<path> is set the game opens no
  * audio device, records the sim's sounds, and writes a WAV at exit. */
 static int g_sound_capture = 0;
+
+/* ---------- Touch input (port addition; gestures in touch.c) ----------
+ * Every gesture ends up as the mouse events the game already understands,
+ * fed through handle_event, so the menus, windows, dialogs and build
+ * tools need no touch-specific code of their own. */
+static void synth_motion(int x, int y)
+{
+    SDL_Event e;
+    memset(&e, 0, sizeof e);
+    e.type = SDL_MOUSEMOTION;
+    e.motion.which = SDL_TOUCH_MOUSEID;
+    e.motion.x = x;
+    e.motion.y = y;
+    e.motion.state = game.touch_drag_btn ? SDL_BUTTON_LMASK : 0;
+    handle_event(&e);
+}
+
+static void synth_button(int down, int x, int y)
+{
+    SDL_Event e;
+    memset(&e, 0, sizeof e);
+    e.type = down ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
+    e.button.which = SDL_TOUCH_MOUSEID;
+    e.button.button = SDL_BUTTON_LEFT;
+    e.button.state = down ? SDL_PRESSED : SDL_RELEASED;
+    e.button.clicks = 1;
+    e.button.x = x;
+    e.button.y = y;
+    game.touch_drag_btn = down;
+    handle_event(&e);
+}
+
+static void synth_click(int x, int y)
+{
+    synth_motion(x, y);
+    synth_button(1, x, y);
+    synth_button(0, x, y);
+}
+
+/* Does the UI (not the tower) own this screen point? */
+static int ui_owns_point(int x, int y)
+{
+    if (game.quit_confirm || game.route_confirm || game.notice_modal ||
+        game.disaster_modal || game.find_open || game.name_edit_open ||
+        game.movie_dlg_open || game.menu_open >= 0)
+        return 1;
+    if (menu_bar_hit_test(x, y) >= 0) return 1;
+    if (point_in_any_window(x, y)) return 1;
+    if (game.win_toolbar && x >= game.tool_x && x < game.tool_x + TOOL_WIN_W &&
+        y >= game.tool_y && y < game.tool_y + tool_win_height())
+        return 1;
+    if (game.person_open && point_in_rect(x, y, person_popup_rect())) return 1;
+    if (game.inspect_open) {
+        Tenant *t = tower_tenant(&game.tower, game.inspect_tid);
+        if (t) {
+            TiLayout L; ti_build(t, &L);
+            SDL_Rect r = { game.inspect_x, game.inspect_y, L.w, L.h };
+            if (point_in_rect(x, y, r)) return 1;
+        }
+    }
+    return 0;
+}
+
+static int build_tool_active(void)
+{
+    return game.build_type != ITEM_NONE && !game.demolish_mode &&
+           !game.finger_mode && !game.inspect_mode && !game.elv_edit_mode;
+}
+
+/* A shaft's motor room or pit under (floor, cell)? (try_cap_drag's test,
+ * without arming the drag) */
+static int cap_at(int floor, int cell)
+{
+    PeopleSim *ps = &game.sim.people;
+    int fidx = floor_to_index(floor);
+    for (int i = 0; i < ps->shaft_count; i++) {
+        ElevatorShaft *sh = &ps->shafts[i];
+        if (!sh->active) continue;
+        if (cell < sh->x || cell >= sh->x + ITEM_WIDTH[sh->type]) continue;
+        if (fidx == sh->hi + 1 || fidx == sh->lo - 1) return 1;
+    }
+    return 0;
+}
+
+/* ---- Placement confirm: a small Win3.1 box under the parked ghost ---- */
+#define PC_W     136
+#define PC_BTN   24
+#define PC_H     (WIN_TITLEBAR_H + 4 + PC_BTN + 4 + 22 + 6)
+
+static void place_confirm_origin(int *ox, int *oy)
+{
+    if (game.place_box_x >= 0) {      /* anchored where it first opened */
+        *ox = game.place_box_x;
+        *oy = game.place_box_y;
+        return;
+    }
+    int gx, gy;
+    grid_to_screen(game.place_floor, game.place_cell, &gx, &gy);
+    gx = (int)(gx * game.zoom);
+    gy = (int)(gy * game.zoom);
+    int x = gx - PC_W / 2;
+    int y = gy + (int)(CELL_H * game.zoom) + 8;          /* below the row */
+    if (y + PC_H > game.screen_h) y = gy - (int)(CELL_H * game.zoom) - PC_H - 8;
+    clamp_win(&x, &y, PC_W, PC_H);
+    *ox = x; *oy = y;
+}
+
+/* Re-anchor the box if a nudge pushed the ghost underneath it. */
+static void place_confirm_reanchor(void)
+{
+    int gx, gy;
+    grid_to_screen(game.place_floor, game.place_cell, &gx, &gy);
+    SDL_Rect ghost = { (int)((gx - 4 * CELL_W) * game.zoom),
+                       (int)((gy - CELL_H) * game.zoom),
+                       (int)(9 * CELL_W * game.zoom), (int)(3 * CELL_H * game.zoom) };
+    SDL_Rect box = { game.place_box_x, game.place_box_y, PC_W, PC_H };
+    if (game.place_box_x < 0 || SDL_HasIntersection(&ghost, &box)) {
+        game.place_box_x = -1;
+        int x, y;
+        place_confirm_origin(&x, &y);
+        game.place_box_x = x;
+        game.place_box_y = y;
+    }
+}
+
+/* Button rects: 0..3 = left/up/down/right nudges, 4 = Build, 5 = Cancel */
+static SDL_Rect place_confirm_button(int i)
+{
+    int ox, oy;
+    place_confirm_origin(&ox, &oy);
+    int ry = oy + WIN_TITLEBAR_H + 4;
+    if (i < 4) {
+        int gap = (PC_W - 4 * PC_BTN) / 5;
+        return (SDL_Rect){ ox + gap + i * (PC_BTN + gap), ry, PC_BTN, PC_BTN };
+    }
+    int bw = (PC_W - 18) / 2;
+    return (SDL_Rect){ ox + 6 + (i - 4) * (bw + 6), ry + PC_BTN + 4, bw, 22 };
+}
+
+static void draw_nudge_arrow(SDL_Rect r, int dir)   /* 0 L, 1 U, 2 D, 3 R */
+{
+    int cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+    SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
+    for (int k = 0; k <= 6; k++) {
+        switch (dir) {
+        case 0: SDL_RenderDrawLine(game.renderer, cx - 4 + k, cy - k, cx - 4 + k, cy + k); break;
+        case 3: SDL_RenderDrawLine(game.renderer, cx + 4 - k, cy - k, cx + 4 - k, cy + k); break;
+        case 1: SDL_RenderDrawLine(game.renderer, cx - k, cy - 4 + k, cx + k, cy - 4 + k); break;
+        default: SDL_RenderDrawLine(game.renderer, cx - k, cy + 4 - k, cx + k, cy + 4 - k); break;
+        }
+    }
+}
+
+static void render_place_confirm(void)
+{
+    if (!game.place_pending) return;
+    if (!build_tool_active()) { game.place_pending = 0; return; }
+    int ox, oy;
+    place_confirm_origin(&ox, &oy);
+    draw_win31_titlebar(ox, oy, PC_W, tower_item_name(game.build_type));
+    draw_win31_rect(ox, oy + WIN_TITLEBAR_H, PC_W, PC_H - WIN_TITLEBAR_H, 1);
+    for (int i = 0; i < 4; i++) {
+        SDL_Rect r = place_confirm_button(i);
+        draw_btn31(r, "", 0, 1);
+        draw_nudge_arrow(r, i);
+    }
+    draw_btn31(place_confirm_button(4), "Build", 1, 1);
+    draw_btn31(place_confirm_button(5), "Cancel", 0, 1);
+}
+
+/* Park the ghost at the point a build tool was tapped. */
+static void place_confirm_at(int x, int y)
+{
+    int f, c;
+    mouse_to_grid(x, y, &f, &c);
+    game.place_pending = 1;
+    game.place_floor = f;
+    game.place_cell = c;
+    game.place_box_x = -1;           /* open next to the new spot */
+    place_confirm_reanchor();
+}
+
+/* Returns 1 if the tap landed on the confirm box. */
+static int place_confirm_tap(int x, int y)
+{
+    if (!game.place_pending) return 0;
+    for (int i = 0; i < 6; i++) {
+        if (!point_in_rect(x, y, place_confirm_button(i))) continue;
+        switch (i) {
+        case 0: game.place_cell--;  break;
+        case 1: game.place_floor++; break;
+        case 2: game.place_floor--; break;
+        case 3: game.place_cell++;  break;
+        case 4: {
+            /* Build: a click at the parked cell through the normal path.
+             * The press point only has to miss every window; the build
+             * itself reads mouse_floor/mouse_cell. */
+            int gx, gy;
+            grid_to_screen(game.place_floor, game.place_cell, &gx, &gy);
+            gx = (int)((gx + CELL_W / 2) * game.zoom);
+            gy = (int)((gy + CELL_H / 2) * game.zoom);
+            long money0 = game.tower.money;
+            int count0 = game.tower.tenant_count;
+            game.place_pending = 0;
+            synth_button(1, gx, gy);   /* no motion: keep the parked cell */
+            synth_button(0, gx, gy);
+            /* refused (the message line says why): keep the ghost parked
+             * so it can be nudged and tried again */
+            if (game.tower.money == money0 && game.tower.tenant_count == count0)
+                game.place_pending = 1;
+            break;
+        }
+        default: game.place_pending = 0; break;
+        }
+        if (game.place_cell < 0) game.place_cell = 0;
+        if (game.place_cell >= TOWER_WIDTH) game.place_cell = TOWER_WIDTH - 1;
+        if (game.place_pending && i < 4) place_confirm_reanchor();
+        return 1;
+    }
+    {   /* the box's body swallows near-misses */
+        int ox, oy;
+        place_confirm_origin(&ox, &oy);
+        SDL_Rect body = { ox, oy, PC_W, PC_H };
+        if (point_in_rect(x, y, body)) return 1;
+    }
+    return 0;
+}
+
+static void tooltip_long_press(int x, int y);   /* tooltips, below */
+
+static void th_tap(void *ctx, int x, int y)
+{
+    (void)ctx;
+    if (place_confirm_tap(x, y)) return;
+    int popup = game.inspect_open || game.person_open;
+    if (build_tool_active() && !popup && !ui_owns_point(x, y) &&
+        !game.sim.event.active) {
+        place_confirm_at(x, y);          /* ask before building */
+        synth_motion(x, y);
+        return;
+    }
+    synth_click(x, y);
+}
+
+static int th_claims_drag(void *ctx, int x, int y)
+{
+    (void)ctx;
+    if (ui_owns_point(x, y)) return 1;   /* drag a window, a slider... */
+    if (game.sim.event.active) return 0;
+    if (build_tool_active()) return 1;   /* lay a row / a floor run */
+    int f, c;
+    mouse_to_grid(x, y, &f, &c);
+    return !game.demolish_mode && !game.inspect_mode && cap_at(f, c);
+}
+
+static void th_drag_start(void *ctx, int x, int y)
+{
+    (void)ctx;
+    game.place_pending = 0;
+    synth_motion(x, y);
+    synth_button(1, x, y);
+}
+
+static void th_drag_move(void *ctx, int x, int y) { (void)ctx; synth_motion(x, y); }
+
+static void th_drag_end(void *ctx, int x, int y)
+{
+    (void)ctx;
+    synth_motion(x, y);
+    synth_button(0, x, y);
+}
+
+static void th_drag_cancel(void *ctx)
+{
+    (void)ctx;
+    /* A cap drag and a window drag were live all along: let them finish
+     * where they are. A build drag is abandoned, not committed. */
+    if (game.cap_drag || game.win_dragging) {
+        synth_button(0, game.mouse_x, game.mouse_y);
+        return;
+    }
+    game.dragging = 0;
+    game.touch_drag_btn = 0;
+}
+
+static void th_pan(void *ctx, float dx, float dy)
+{
+    (void)ctx;
+    game.cam_fx -= dx / game.zoom;
+    game.cam_fy -= dy / game.zoom;
+    game.cam_anim = 0;
+}
+
+static void th_zoom(void *ctx, int dir, int cx, int cy)
+{
+    (void)ctx;
+    zoom_step(dir, cx, cy);
+}
+
+static void th_long_press(void *ctx, int x, int y)
+{
+    (void)ctx;
+    tooltip_long_press(x, y);
+}
+
+static const TouchHandlers TOUCH_HANDLERS = {
+    .ctx = NULL,
+    .tap = th_tap,
+    .drag_start = th_drag_start,
+    .drag_move = th_drag_move,
+    .drag_end = th_drag_end,
+    .drag_cancel = th_drag_cancel,
+    .pan = th_pan,
+    .zoom_step = th_zoom,
+    .long_press = th_long_press,
+    .claims_drag = th_claims_drag,
+};
+
+static void touch_event(const SDL_Event *ev)
+{
+    /* A Mac trackpad reports its fingers too; only a touchscreen (direct
+     * touch) is a pointer. Trackpad pinch-zoom comes as Ctrl+wheel. */
+#if SDL_VERSION_ATLEAST(2, 0, 10)
+    if (SDL_GetTouchDeviceType(ev->tfinger.touchId) != SDL_TOUCH_DEVICE_DIRECT)
+        return;
+#endif
+    float x = ev->tfinger.x * game.screen_w;
+    float y = ev->tfinger.y * game.screen_h;
+    long long id = (long long)ev->tfinger.fingerId;
+    switch (ev->type) {
+    case SDL_FINGERDOWN:
+        /* the event's own time, not when this frame got to it: a slow
+         * frame must not turn a quick tap into a long-press */
+        touch_down(&game.touch, &TOUCH_HANDLERS, id, x, y, ev->tfinger.timestamp);
+        break;
+    case SDL_FINGERMOTION:
+        touch_move(&game.touch, &TOUCH_HANDLERS, id, x, y);
+        break;
+    case SDL_FINGERUP:
+        touch_up(&game.touch, &TOUCH_HANDLERS, id, x, y);
+        break;
+    }
+}
+
+/* ---------- Tooltips and explainers (port addition; text in hints.c) ----
+ * BrandyTower's title-attribute tooltips and inspector notes, drawn in the
+ * port's Win3.1 chrome. A mouse gets them after resting TIP_DELAY_MS on a
+ * target; a touchscreen has no hover, so a long-press pins one (and on the
+ * tower itself shows that unit's notes). */
+#define TIP_DELAY_MS 500
+#define TIP_MAX_W    300
+
+static void tooltip_long_press(int x, int y)
+{
+    game.tip_pinned = 1;
+    game.tip_x = x;
+    game.tip_y = y;
+}
+
+static int info_stars_rect(SDL_Rect *r)
+{
+    if (!game.win_infobar) return 0;
+    *r = (SDL_Rect){ game.info_x + 42, game.info_y + WIN_TITLEBAR_H + 2,
+                     5 * 21, 19 };
+    return 1;
+}
+
+static void tooltip_input(const SDL_Event *ev)
+{
+    int real_mouse =
+        (ev->type == SDL_MOUSEMOTION && ev->motion.which != SDL_TOUCH_MOUSEID) ||
+        (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.which != SDL_TOUCH_MOUSEID) ||
+        ev->type == SDL_MOUSEWHEEL;
+    /* a touchscreen finger (a Mac trackpad's fingers are not pointers) */
+    int finger = ev->type == SDL_FINGERDOWN
+#if SDL_VERSION_ATLEAST(2, 0, 10)
+        && SDL_GetTouchDeviceType(ev->tfinger.touchId) == SDL_TOUCH_DEVICE_DIRECT
+#endif
+        ;
+    if (real_mouse || ev->type == SDL_KEYDOWN || finger) {
+        game.tip_moved_ms = SDL_GetTicks();
+        game.tip_pinned = 0;
+    }
+    if (finger) game.last_input_touch = 1;
+    else if (real_mouse) game.last_input_touch = 0;
+    /* A press on the stars (mouse or tap) pins the rating checklist —
+     * BrandyTower's "press the rating for what's next". */
+    if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_LEFT) {
+        SDL_Rect sr;
+        if (info_stars_rect(&sr) && point_in_rect(ev->button.x, ev->button.y, sr))
+            tooltip_long_press(ev->button.x, ev->button.y);
+    }
+}
+
+/* The item a toolbox group button stands for right now. */
+static ItemType tool_button_item(int i)
+{
+    const ToolButton *tb = &tool_buttons[i];
+    for (int j = 0; j < tb->sub_count; j++)
+        if (tb->sub[j] == (ItemType)game.build_type) return tb->sub[j];
+    if (item_unlocked(tb->type)) return tb->type;
+    for (int j = 0; j < tb->sub_count; j++)
+        if (item_unlocked(tb->sub[j])) return tb->sub[j];
+    return tb->type;
+}
+
+#define TIP_PUSH(...) do { if (n < max) { \
+    snprintf(lines[n], HINT_LEN, __VA_ARGS__); n++; } } while (0)
+
+/* What the tooltip at screen (x, y) says. `world` also explains the unit
+ * under the point (long-press only — hovering the tower stays quiet). */
+static int tooltip_content(int x, int y, int world,
+                           char lines[][HINT_LEN], int max)
+{
+    int n = 0;
+    /* Build menus: the hovered item, with why it's greyed. */
+    if (game.menu_open >= 0 && game.menu_hover >= 0) {
+        const TopMenu *tm = &top_menus[game.menu_open];
+        if (game.menu_hover < tm->count) {
+            const MenuItem *it = &tm->items[game.menu_hover];
+            if (it->label && it->build_type != ITEM_NONE)
+                return hints_tool(&game.sim, &game.tower, it->build_type,
+                                  lines, max);
+        }
+        return 0;
+    }
+    if (game.win_toolbar) {
+        int wy = game.tool_y + WIN_TITLEBAR_H, speed_y = wy + 8;
+        int tools_y = speed_y + 28;
+        /* pull-down sub-items */
+        if (game.tool_popup >= 0 && game.tool_popup < TOOL_BTN_COUNT) {
+            int nvis = tool_sub_visible_count(game.tool_popup);
+            for (int vj = 0; vj < nvis; vj++) {
+                int j = tool_sub_visible_index(game.tool_popup, vj), bx, by;
+                if (j < 0) continue;
+                tool_sub_rect(game.tool_popup, vj, &bx, &by);
+                SDL_Rect r = { bx, by, TOOL_BTN_SIZE, TOOL_BTN_SIZE };
+                if (point_in_rect(x, y, r))
+                    return hints_tool(&game.sim, &game.tower,
+                                      tool_buttons[game.tool_popup].sub[j],
+                                      lines, max);
+            }
+        }
+        for (int i = 0; i < TOOL_BTN_COUNT; i++) {
+            int bx, by;
+            tool_button_rect(i, &bx, &by);
+            SDL_Rect r = { bx, by, TOOL_BTN_SIZE, TOOL_BTN_SIZE };
+            if (!point_in_rect(x, y, r)) continue;
+            n = hints_tool(&game.sim, &game.tower, tool_button_item(i),
+                           lines, max);
+            if (tool_buttons[i].sub_count > 1)
+                TIP_PUSH("Hold for the other kinds in this group");
+            return n;
+        }
+        SDL_Rect play = { game.tool_x + (TOOL_WIN_W - SPEED_BTN_W) / 2, speed_y,
+                          SPEED_BTN_W, SPEED_BTN_H };
+        if (point_in_rect(x, y, play)) {
+            TIP_PUSH("%s (Space)", game.sim.speed > 0 ? "Pause" : "Play");
+            TIP_PUSH("Normal and Fast Mode are in the Speed menu");
+            return n;
+        }
+        int tx = game.tool_x + (TOOL_WIN_W - 3 * 21) / 2;
+        static const char *tools[3][2] = {
+            { "Bulldozer", "Demolish a unit, stairs or a shaft" },
+            { "Hand", "Open an elevator's controls, or drag a shaft's top or "
+                      "bottom to resize it. On a touchscreen, drag to scroll" },
+            { "Inspector", "Show a unit's tenants, opinion and notes" },
+        };
+        for (int t = 0; t < 3; t++) {
+            SDL_Rect r = { tx + t * 21, tools_y, 21, 21 };
+            if (point_in_rect(x, y, r)) {
+                TIP_PUSH("%s", tools[t][0]);
+                TIP_PUSH("%s", tools[t][1]);
+                return n;
+            }
+        }
+    }
+    if (game.win_infobar) {
+        SDL_Rect sr;
+        if (info_stars_rect(&sr) && point_in_rect(x, y, sr))
+            return hints_rating(&game.sim, &game.tower, lines, max);
+        int wy = game.info_y + WIN_TITLEBAR_H;
+        SDL_Rect fund = { game.info_x + INFO_BAR_W - 120, wy, 120, INFO_BAR_H / 2 };
+        SDL_Rect pop  = { game.info_x + INFO_BAR_W - 120, wy + INFO_BAR_H / 2,
+                          120, INFO_BAR_H / 2 };
+        if (point_in_rect(x, y, fund)) {
+            TIP_PUSH("Funds");
+            TIP_PUSH("Rent is collected each quarter; shops and restaurants "
+                     "pay by the day. Report: View > Financial Statement (F7)");
+            return n;
+        }
+        if (point_in_rect(x, y, pop)) {
+            TIP_PUSH("Population");
+            TIP_PUSH("Star ratings judge the standing population: workers "
+                     "count while employed, not only while in the building");
+            if (game.tower.star_rating < 6) {
+                char want[HINT_LEN];
+                hints_next_rating(&game.sim, &game.tower, want, sizeof want);
+                TIP_PUSH("%s", want);
+            }
+            return n;
+        }
+    }
+    if (game.win_map) {
+        int map_x = game.map_x + 4, map_w = MAP_WIN_W - 8;
+        int map_y = game.map_y + WIN_TITLEBAR_H + 4;
+        int map_h = MAP_WIN_H - WIN_TITLEBAR_H - 26;
+        SDL_Rect tabs = { map_x, map_y + map_h + 2, map_w, MAP_TAB_H };
+        if (point_in_rect(x, y, tabs)) {
+            static const char *tab[4][2] = {
+                { "Edit", "The tower as built. Press the map to go there" },
+                { "Eval", "Each unit in its tenants' opinion: cyan good, "
+                          "yellow fair, red bad (they will leave)" },
+                { "Pricing", "Each unit colored by its rent tier" },
+                { "Hotel", "Hotel rooms by state: free, sold, dirty, roaches. "
+                           "Opens at 2 stars" },
+            };
+            int m = (x - map_x) / (map_w / 4);
+            if (m > 3) m = 3;
+            TIP_PUSH("%s", tab[m][0]);
+            TIP_PUSH("%s", tab[m][1]);
+            return n;
+        }
+    }
+    if (world && !ui_owns_point(x, y)) {
+        int f, c;
+        mouse_to_grid(x, y, &f, &c);
+        int fidx = floor_to_index(f);
+        if (fidx < 0 || fidx >= TOWER_FLOOR_COUNT || c < 0 || c >= TOWER_WIDTH)
+            return 0;
+        Tenant *t = tower_tenant(&game.tower, game.tower.grid[fidx][c].tenant_id);
+        if (!t) return 0;
+        if (t->name[0]) TIP_PUSH("%s (%s)", t->name, tower_item_name(t->type));
+        else TIP_PUSH("%s", tower_item_name(t->type));
+        n += hints_tenant_notes(&game.sim, &game.tower, t, lines + n, max - n);
+        if (n == 1) TIP_PUSH("Nothing needs attention here");
+        return n;
+    }
+    return n;
+}
+
+/* Greedy word-wrap of `in` into `out` at max_w px in `font`. */
+static int wrap_lines(TTF_Font *font, char in[][HINT_LEN], int nin,
+                      char out[][HINT_LEN], int max, int max_w, int *widest)
+{
+    int n = 0;
+    *widest = 0;
+    for (int i = 0; i < nin && n < max; i++) {
+        const char *p = in[i];
+        /* keep leading indentation on continuation lines */
+        int indent = 0;
+        while (p[indent] == ' ') indent++;
+        char cur[HINT_LEN] = "";
+        while (*p && n < max) {
+            const char *sp = strchr(p + (*p == ' '), ' ');
+            int wl = sp ? (int)(sp - p) : (int)strlen(p);
+            char trial[HINT_LEN];
+            snprintf(trial, sizeof trial, "%s%.*s", cur, wl, p);
+            int tw = 0, th = 0;
+            if (font) TTF_SizeUTF8(font, trial, &tw, &th);
+            if (tw > max_w && cur[0]) {
+                int cw = 0;
+                if (font) TTF_SizeUTF8(font, cur, &cw, &th);
+                if (cw > *widest) *widest = cw;
+                snprintf(out[n++], HINT_LEN, "%s", cur);
+                snprintf(cur, sizeof cur, "%*s", indent + 2, "");
+                while (*p == ' ') p++;
+                continue;
+            }
+            snprintf(cur, sizeof cur, "%s", trial);
+            p += wl;
+        }
+        if (cur[0] && n < max) {
+            int cw = 0, th;
+            if (font) TTF_SizeUTF8(font, cur, &cw, &th);
+            if (cw > *widest) *widest = cw;
+            snprintf(out[n++], HINT_LEN, "%s", cur);
+        }
+    }
+    return n;
+}
+
+static void draw_hint_text(TTF_Font *font, const char *s, int x, int y)
+{
+    if (!font || !s[0]) return;
+    SDL_Color black = { 0, 0, 0, 255 };
+    SDL_Surface *ts = TTF_RenderUTF8_Blended(font, s, black);
+    if (!ts) return;
+    SDL_Texture *tx = SDL_CreateTextureFromSurface(game.renderer, ts);
+    if (tx) {
+        SDL_Rect d = { x, y, ts->w, ts->h };
+        SDL_RenderCopy(game.renderer, tx, NULL, &d);
+        SDL_DestroyTexture(tx);
+    }
+    SDL_FreeSurface(ts);
+}
+
+/* A grey Win3.1 box of wrapped lines; first line bold as the heading. */
+static void draw_hint_box(char in[][HINT_LEN], int nin, int x, int y,
+                          int anchor_below, int max_w)
+{
+    TTF_Font *body = game.font_dlg ? game.font_dlg : game.font_small;
+    char out[HINT_LINES * 3][HINT_LEN];
+    int widest = 0;
+    int n = wrap_lines(body, in, nin, out, HINT_LINES * 3, max_w, &widest);
+    if (n <= 0) return;
+    int lh = body ? TTF_FontLineSkip(body) : 14;
+    int w = widest + 12, h = n * lh + 8;
+    if (anchor_below) { x += 14; y += 20; }
+    if (x + w > game.screen_w - 2) x = game.screen_w - 2 - w;
+    if (y + h > game.screen_h - 2) y = (anchor_below ? y - 28 : y) - h;
+    if (x < 2) x = 2;
+    if (y < 2) y = 2;
+    draw_win31_rect(x, y, w, h, 1);
+    SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
+    SDL_Rect border = { x - 1, y - 1, w + 2, h + 2 };
+    SDL_RenderDrawRect(game.renderer, &border);
+    for (int i = 0; i < n; i++)
+        draw_hint_text(i == 0 && game.font ? game.font : body, out[i],
+                       x + 6, y + 4 + i * lh);
+}
+
+static void render_tooltip(void)
+{
+    if (game.quit_confirm || game.disaster_modal || game.notice_modal ||
+        game.route_confirm || game.find_open)
+        return;
+    int x, y, world = 0;
+    if (game.tip_pinned) {
+        x = game.tip_x; y = game.tip_y; world = 1;
+    } else {
+        if (game.last_input_touch || touch_active(&game.touch) ||
+            game.dragging || game.cam_panning || game.win_dragging)
+            return;
+        if (SDL_GetTicks() - game.tip_moved_ms < TIP_DELAY_MS) return;
+        x = game.mouse_x; y = game.mouse_y;
+    }
+    char lines[HINT_LINES][HINT_LEN];
+    int n = tooltip_content(x, y, world, lines, HINT_LINES);
+    if (n <= 0) return;
+    int max_w = TIP_MAX_W < game.screen_w - 24 ? TIP_MAX_W : game.screen_w - 24;
+    draw_hint_box(lines, n, x, y, 1, max_w);
+}
+
+/* ---- Notes docked under the tenant info dialog (advice.ts) ---- */
+static int tenant_notes_lines(char lines[][HINT_LEN], int max)
+{
+    if (!game.inspect_open) return 0;
+    Tenant *t = tower_tenant(&game.tower, game.inspect_tid);
+    if (!t) return 0;
+    return hints_tenant_notes(&game.sim, &game.tower, t, lines, max);
+}
+
+static int notes_panel_rect(SDL_Rect *r)
+{
+    char lines[HINT_LINES][HINT_LEN];
+    int n = tenant_notes_lines(lines, HINT_LINES);
+    if (n <= 0) return 0;
+    Tenant *t = tower_tenant(&game.tower, game.inspect_tid);
+    TiLayout L; ti_build(t, &L);
+    TTF_Font *body = game.font_dlg ? game.font_dlg : game.font_small;
+    char out[HINT_LINES * 3][HINT_LEN];
+    int widest;
+    int w = L.w;
+    int k = wrap_lines(body, lines, n, out, HINT_LINES * 3, w - 12, &widest);
+    int lh = body ? TTF_FontLineSkip(body) : 14;
+    int h = WIN_TITLEBAR_H + k * lh + 8;
+    int x = game.inspect_x, y = game.inspect_y + L.h + 2;
+    if (y + h > game.screen_h) y = game.inspect_y - h - 2;   /* above */
+    if (y < MENU_BAR_H) {                                    /* beside */
+        y = game.inspect_y;
+        x = game.inspect_x + L.w + 2;
+        if (x + w > game.screen_w) x = game.inspect_x - w - 2;
+    }
+    *r = (SDL_Rect){ x, y, w, h };
+    return 1;
+}
+
+static void render_tenant_notes(void)
+{
+    SDL_Rect r;
+    if (!notes_panel_rect(&r)) return;
+    char lines[HINT_LINES][HINT_LEN];
+    int n = tenant_notes_lines(lines, HINT_LINES);
+    draw_win31_titlebar(r.x, r.y, r.w, "Notes");
+    draw_win31_rect(r.x, r.y + WIN_TITLEBAR_H, r.w, r.h - WIN_TITLEBAR_H, 1);
+    TTF_Font *body = game.font_dlg ? game.font_dlg : game.font_small;
+    char out[HINT_LINES * 3][HINT_LEN];
+    int widest;
+    int k = wrap_lines(body, lines, n, out, HINT_LINES * 3, r.w - 12, &widest);
+    int lh = body ? TTF_FontLineSkip(body) : 14;
+    for (int i = 0; i < k; i++)
+        draw_hint_text(body, out[i], r.x + 6, r.y + WIN_TITLEBAR_H + 4 + i * lh);
+}
+
+/* ---------- Responsive layout (port addition) ----------
+ * The original's windows sit at fixed spots on a 640x480+ desktop. The
+ * port's view now follows the browser window, so place them for the size
+ * we actually have: faithful defaults wherever they fit, then fall-backs
+ * for phones, and finally clamp everything on screen. Windows the player
+ * dragged keep their spot (clamped). */
+static void clamp_win(int *x, int *y, int w, int h)
+{
+    if (*x + w > game.screen_w) *x = game.screen_w - w;
+    if (*y + h > game.screen_h) *y = game.screen_h - h;
+    if (*x < 0) *x = 0;
+    if (*y < MENU_BAR_H) *y = MENU_BAR_H;
+}
+
+static void layout_windows(void)
+{
+    int W = game.screen_w;
+    int info_h = WIN_TITLEBAR_H + INFO_BAR_H;
+    /* Map and info bar can't share the top row below this width. */
+    int narrow = W < MAP_WIN_W + INFO_BAR_W + 8;
+    if (narrow && !game.narrow_layout)
+        game.win_map = 0;        /* phones start without the minimap; the
+                                  * Windows menu still shows it */
+    else if (!narrow && game.narrow_layout)
+        game.win_map = 1;
+    game.narrow_layout = narrow;
+
+    if (!(game.win_moved & 1)) {
+        game.info_x = W - INFO_BAR_W;
+        game.info_y = MENU_BAR_H;
+    }
+    if (!(game.win_moved & 2)) {
+        game.map_x = 0;
+        game.map_y = MENU_BAR_H;
+        /* narrow but shown anyway: under the info bar, not behind it */
+        if (narrow) game.map_y = MENU_BAR_H + info_h;
+    }
+    if (!(game.win_moved & 4)) {
+        int th = tool_win_height();
+        int top = MENU_BAR_H;
+        /* info bar overlapping the toolbox column pushes it down */
+        if (game.win_infobar && game.info_x < TOOL_WIN_W) top += info_h;
+        game.tool_x = 0;
+        game.tool_y = game.win_map ? game.map_y + MAP_WIN_H : top;
+        /* too short to stack under the map (landscape phones): beside it */
+        if (game.tool_y + th > game.screen_h && game.win_map) {
+            game.tool_x = MAP_WIN_W;
+            game.tool_y = top;
+        }
+    }
+    clamp_win(&game.info_x, &game.info_y, INFO_BAR_W, info_h);
+    clamp_win(&game.map_x, &game.map_y, MAP_WIN_W, MAP_WIN_H);
+    clamp_win(&game.tool_x, &game.tool_y, TOOL_WIN_W, tool_win_height());
+    clamp_win(&game.elv_x, &game.elv_y, ELV_W, WIN_TITLEBAR_H);
+    clamp_win(&game.fin_x, &game.fin_y, FIN_DLG_W, WIN_TITLEBAR_H);
+}
+
+/* Native HiDPI (macOS Retina): the renderer's output is k x the window's
+ * logical size; draw in logical pixels at an integer scale so the art
+ * stays whole-pixel. Web does this in the shell (canvas CSS size). */
+static void update_px_scale(void)
+{
+    int ww = game.screen_w, ow = ww, oh;
+    SDL_GetWindowSize(game.window, &ww, NULL);
+    SDL_GetRendererOutputSize(game.renderer, &ow, &oh);
+    int k = ww > 0 ? ow / ww : 1;
+    if (k < 1) k = 1;
+    game.px_scale = k;
+    SDL_RenderSetScale(game.renderer, (float)k, (float)k);
+}
+
+/* A new logical view size (window resize, rotation, fullscreen). */
+static void apply_view_size(int w, int h)
+{
+    if (w < 320) w = 320;
+    if (h < 240) h = 240;
+    if (w == game.screen_w && h == game.screen_h) return;
+    game.screen_w = w;
+    game.screen_h = h;
+    update_view_size();
+    layout_windows();
+    clamp_camera();
+}
+
+static void apply_pending_requests(void)
+{
+    if (game.pending_view_w > 0 && game.pending_view_h > 0) {
+        int w = game.pending_view_w, h = game.pending_view_h;
+        game.pending_view_w = game.pending_view_h = 0;
+        SDL_SetWindowSize(game.window, w, h);
+        apply_view_size(w, h);
+    }
+    /* Re-place the windows whenever an input to the layout changes — the
+     * toolbox grows with the star rating, windows are shown/hidden from
+     * the Windows menu, a load swaps the tower under us. */
+    {
+        static int sig[7];
+        int now[7] = { game.screen_w, game.screen_h, tool_win_height(),
+                       game.win_map, game.win_infobar, game.win_toolbar,
+                       game.win_moved };
+        if (memcmp(sig, now, sizeof now)) {
+            memcpy(sig, now, sizeof now);
+            layout_windows();
+        }
+    }
+    while (game.pending_zoom) {
+        int d = game.pending_zoom > 0 ? 1 : -1;
+        game.pending_zoom -= d;
+        zoom_step(d, game.pending_zoom_x, game.pending_zoom_y);
+    }
+}
+
+#ifdef __EMSCRIPTEN__
+/* Shell -> engine: the logical canvas size it picked for this viewport
+ * (integer device px per logical px; see web/shell.html fitView). */
+EMSCRIPTEN_KEEPALIVE void ct_set_view(int w, int h)
+{
+    game.pending_view_w = w;
+    game.pending_view_h = h;
+}
+
+/* Test probes (tests/web/probe_touch.js): the view and build state as
+ * JSON, so gestures can be asserted without reading pixels. */
+EMSCRIPTEN_KEEPALIVE const char *ct_view_state(void)
+{
+    static char buf[256];
+    snprintf(buf, sizeof buf,
+             "{\"zoom\":%d,\"cx\":%.1f,\"cy\":%.1f,\"sw\":%d,\"sh\":%d,"
+             "\"vw\":%d,\"vh\":%d,\"money\":%ld,\"pending\":%d,"
+             "\"build\":%d,\"map\":%d}",
+             game.zoom_idx, game.cam_fx, game.cam_fy, game.screen_w,
+             game.screen_h, game.view_w, game.view_h, (long)game.tower.money,
+             game.place_pending, (int)game.build_type, game.win_map);
+    return buf;
+}
+
+/* Shell -> engine: one zoom step about a logical canvas point (trackpad
+ * pinch / Ctrl+wheel, accumulated in the shell like BrandyTower's). */
+EMSCRIPTEN_KEEPALIVE void ct_zoom_step(int dir, int x, int y)
+{
+    game.pending_zoom += dir > 0 ? 1 : -1;
+    game.pending_zoom_x = x;
+    game.pending_zoom_y = y;
+}
+#endif
 
 int main(int argc, char *argv[])
 {
@@ -10075,6 +11178,11 @@ int main(int argc, char *argv[])
     }
     exe_strings_init(&game.exe);   /* 0x7f06 string tables + dialog texts */
     
+    /* Touch is handled as gestures (touch.c), not SDL's emulated mouse —
+     * otherwise every pan would also be a build drag. */
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+    SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
+
     /* Initialize SDL */
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -10083,7 +11191,25 @@ int main(int argc, char *argv[])
     
     game.screen_w = WINDOW_W;
     game.screen_h = WINDOW_H;
+    /* The web shell sizes the canvas to the browser window and passes the
+     * logical size in (CT_VIEW_W/H); native keeps the original 960x720. */
+    {
+        int vw = 0, vh = 0;
+        if (getenv("CT_VIEW_W") && getenv("CT_VIEW_H")) {
+            vw = atoi(getenv("CT_VIEW_W"));
+            vh = atoi(getenv("CT_VIEW_H"));
+        }
+        for (int i = 1; i < argc; i++)            /* --view=WxH (web shell) */
+            if (!strncmp(argv[i], "--view=", 7))
+                sscanf(argv[i] + 7, "%dx%d", &vw, &vh);
+        if (vw >= 320 && vh >= 240) { game.screen_w = vw; game.screen_h = vh; }
+    }
+    game.zoom_idx = VIEW_ZOOM_DEFAULT;
+    update_view_size();
     Uint32 wflags = SDL_WINDOW_SHOWN;
+#if !defined(__EMSCRIPTEN__)
+    if (!auto_screenshot) wflags |= SDL_WINDOW_ALLOW_HIGHDPI;
+#endif
 #ifndef __EMSCRIPTEN__
     /* Fixed canvas on the web: under Emscripten RESIZABLE binds the
      * window to the canvas's CSS box, whose transition fired a
@@ -10093,7 +11219,7 @@ int main(int argc, char *argv[])
 #endif
     game.window = SDL_CreateWindow("ConciliaTower",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        WINDOW_W, WINDOW_H, wflags);
+        game.screen_w, game.screen_h, wflags);
     
     /* Software renderer for VNC visibility */
 #ifdef __EMSCRIPTEN__
@@ -10105,9 +11231,20 @@ int main(int argc, char *argv[])
     game.renderer = SDL_CreateRenderer(game.window, -1,
         SDL_RENDERER_ACCELERATED | SDL_RENDERER_TARGETTEXTURE);
     if (!game.renderer)
+#elif defined(__APPLE__)
+    /* macOS dev builds: Metal for crisp Retina output (the Pi service
+     * below keeps the software renderer). */
+    if (!auto_screenshot)
+        game.renderer = SDL_CreateRenderer(game.window, -1,
+            SDL_RENDERER_ACCELERATED | SDL_RENDERER_TARGETTEXTURE);
+    if (!game.renderer)
 #endif
     /* Native stays software: the service runs under Xvfb/VNC with no GPU. */
     game.renderer = SDL_CreateRenderer(game.window, -1, SDL_RENDERER_SOFTWARE);
+
+#ifndef __EMSCRIPTEN__
+    update_px_scale();   /* Retina: draw logical px at an integer scale */
+#endif
 
     /* Replace the bare X-server root cursor with a proper arrow; the bulldozer
      * gets a crosshair. (SimTower swaps the cursor per active tool.) */
@@ -10751,16 +11888,13 @@ int main(int argc, char *argv[])
     
     /* Default window positions (matching original SimTower layout) — shifted
      * below the menu bar so nothing overlaps it. */
-    game.map_x = 0;
-    game.map_y = MENU_BAR_H;           /* Top left, under the bar */
-    game.tool_x = 0;
-    game.tool_y = MENU_BAR_H + MAP_WIN_H;  /* Below minimap */
-    game.info_x = game.screen_w - INFO_BAR_W;
-    game.info_y = MENU_BAR_H;          /* Top right, under the bar */
     game.win_dragging = 0;
     game.tool_popup = -1;
     game.demolish_mode = 0;
     game.win_toolbar = game.win_infobar = game.win_map = 1;
+    /* Map top-left, toolbox below it, info bar top-right — the original's
+     * layout; layout_windows adapts it to narrow (phone) views. */
+    layout_windows();
     game.anim_people = game.anim_effects = 1;
     game.snd_elev = game.snd_bg = game.snd_events = 1;
     /* Test affordances: --screenshot renders one input-less frame, so allow forcing
@@ -11022,7 +12156,14 @@ int main(int argc, char *argv[])
                           exe_dlg_text((uint16_t)(0xBD6 + st - 2), 1, "OK"));
     }
     (void)show_underground;
-    game.zoom = 1.0f;
+    {   /* start at a zoom step (index into VIEW_ZOOM_STEPS): --zoom=N from
+         * the web shell (touch devices open at 2x), CT_ZOOM for tests */
+        int zi = getenv("CT_ZOOM") ? atoi(getenv("CT_ZOOM")) : -1;
+        for (int i = 1; i < argc; i++)
+            if (!strncmp(argv[i], "--zoom=", 7)) zi = atoi(argv[i] + 7);
+        if (zi >= 0)
+            zoom_set(zi, game.screen_w / 2, game.screen_h / 2);
+    }
     
     printf("\n=== ConciliaTower running ===\n");
     printf("Controls:\n");
@@ -11053,10 +12194,14 @@ int main(int argc, char *argv[])
 
     int frame = 0;
     while (game.running) {
+        apply_pending_requests();
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             handle_event(&ev);
         }
+        /* after the queue is drained, so a release already waiting in it
+         * wins over the long-press timer */
+        touch_tick(&game.touch, &TOUCH_HANDLERS, SDL_GetTicks());
 
         /* Build-drag clatter (#7001, referee row 18): a looping sound that
          * rings while a build is being dragged out and stops on release.
@@ -11736,11 +12881,8 @@ int main(int argc, char *argv[])
                 }
                 render();
             }
-            SDL_Surface *sshot = SDL_CreateRGBSurface(0, game.screen_w, game.screen_h, 32,
-                0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
-            SDL_RenderReadPixels(game.renderer, NULL, SDL_PIXELFORMAT_ARGB8888,
-                                 sshot->pixels, sshot->pitch);
-            SDL_SaveBMP(sshot, screenshot_path);
+            SDL_Surface *sshot = read_screen_surface();
+            if (sshot) SDL_SaveBMP(sshot, screenshot_path);
             SDL_FreeSurface(sshot);
             printf("Auto-screenshot saved to %s\n", screenshot_path);
             game.running = 0;

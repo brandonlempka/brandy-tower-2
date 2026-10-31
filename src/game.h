@@ -828,6 +828,34 @@ void game_wedding_daily(GameSim *sim, Tower *tower);
  * Ported from seg_1148 FUN_1148_0000. */
 int game_check_promotion(GameSim *sim, Tower *tower, int target_star);
 
+/* One promotion requirement, for the rating explainer. The gate above is
+ * "every need met", computed from this same list, so the checklist a
+ * player sees can never disagree with the real gate. `timing` marks the
+ * weekday-evening window — a when, not a what to build. */
+typedef struct {
+    const char *label;
+    int         met;
+    int         timing;
+} PromoNeed;
+#define PROMO_NEEDS_MAX 6
+/* Fill `out` with target_star's requirements (beyond population) judged
+ * against flags `f`; returns the count. */
+int game_promotion_needs(const GameSim *sim, const Tower *tower,
+                         const PromotionFlags *f, int target_star,
+                         PromoNeed *out, int max);
+/* Fresh promotion flags straight from the tower (what the next star check
+ * will see) — pure, for the explainer. */
+void game_promotion_flags(const GameSim *sim, const Tower *tower,
+                          PromotionFlags *out);
+/* Standing population needed to rise above `from_star` (1..5). */
+int game_star_pop_needed(int from_star);
+/* Office/condo daily judge: metric at/over this is "stressed" (red). */
+#define GAME_JUDGE_HAPPY 80
+int game_judge_bar(const Tower *tower);
+/* The same-floor neighbor costing this unit the +60 noise penalty, or
+ * ITEM_NONE (NoiseT, the judge's own scan). */
+ItemType game_noisy_neighbor(const Tower *tower, const Tenant *room);
+
 /* Recalculate population from all tenants */
 int game_calc_population(GameSim *sim, Tower *tower);
 

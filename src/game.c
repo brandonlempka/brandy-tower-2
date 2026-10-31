@@ -307,43 +307,45 @@ void game_notify_built(GameSim *sim, Tower *tower)
 
 /* --- Promotion flags scan --- */
 
-static void scan_promotion_flags(GameSim *sim, Tower *tower)
+void game_promotion_flags(const GameSim *sim, const Tower *tower,
+                          PromotionFlags *out)
 {
-    memset(&sim->promo, 0, sizeof(sim->promo));
-    
-    int recycling_centers = 0;
+    memset(out, 0, sizeof(*out));
 
     for (int i = 0; i < tower->tenant_count; i++) {
-        Tenant *t = &tower->tenants[i];
+        const Tenant *t = &tower->tenants[i];
         switch (t->type) {
-        case ITEM_SECURITY:  sim->promo.has_security = 1;  break;
-        case ITEM_RECYCLING: recycling_centers++;          break;
-        case ITEM_METRO:     sim->promo.has_metro = 1;     break;
-        case ITEM_CATHEDRAL: sim->promo.has_cathedral = 1; break;
+        case ITEM_SECURITY:  out->has_security = 1;  break;
+        case ITEM_METRO:     out->has_metro = 1;     break;
+        case ITEM_CATHEDRAL: out->has_cathedral = 1; break;
         case ITEM_HOTEL_SUITE:
-            sim->promo.has_suite = 1;
+            out->has_suite = 1;
             break;
         default: break;
         }
     }
+    out->recycling_adequate = sim->recycling_adequate;
+    out->medical_adequate = sim->medical_adequate;
+    out->vip_visited = sim->vip_satisfied;
+}
+
+static void scan_promotion_flags(GameSim *sim, Tower *tower)
+{
+    game_promotion_flags(sim, tower, &sim->promo);
 
     /* TrashT (seg_1088): adequate while population stays under 2500 per
      * recycling center; inadequate flips trucks off and blocks star 4/5. */
     /* 0xB92C is maintained by the TrashT daily schedule (the 5:58AM
      * stage-5 call is the end-of-day capacity verdict); the promo scan
      * just reads it, like medical. */
-    (void)recycling_centers;
-    sim->promo.recycling_adequate = sim->recycling_adequate;
+    /* (read by game_promotion_flags) */
 
     /* 0xB92D lives on the sim (armed 7AM, cleared by the no-center path);
      * the scan just mirrors it into the flag bank */
-    sim->promo.medical_adequate = sim->medical_adequate;
 
     /* [0xB923] mirror — the favorable-VIP flag; persistent until a
      * promotion ceremony clears it (VIP-topology referee 2026-08-03:
      * cleared at 1148:004f on EVERY ceremony). */
-    sim->promo.vip_visited = sim->vip_satisfied;
-
     sim->tower_width = game_measure_width(tower);
 }
 
@@ -398,10 +400,7 @@ int game_check_star_rating(GameSim *sim, Tower *tower)
     int next_star = current + 1;
     
     if (next_star > 6) return current;
-    /* Thresholds for 2-5 stars come from the live tuning table;
-     * TOWER's 15,000 stays hardcoded like the original EXE */
-    int need = (current >= 1 && current <= 4) ? TUNING.star_pop[current - 1]
-                                              : STAR_POP_THRESHOLD[current];
+    int need = game_star_pop_needed(current);
     if (pop < need) return current;
     
     /* NO width gate here: levelup_width_ok (1148:01a8) exists in the EXE
@@ -533,14 +532,27 @@ static int promotion_window_open(const GameSim *sim, const Tower *tower)
     return evening_or_later && !game_is_weekend(tower);
 }
 
-int game_check_promotion(GameSim *sim, Tower *tower, int target_star)
+int game_star_pop_needed(int from_star)
 {
+    /* Thresholds for 2-5 stars come from the live tuning table;
+     * TOWER's 15,000 stays hardcoded like the original EXE */
+    return (from_star >= 1 && from_star <= 4) ? TUNING.star_pop[from_star - 1]
+                                              : STAR_POP_THRESHOLD[from_star];
+}
+
+int game_promotion_needs(const GameSim *sim, const Tower *tower,
+                         const PromotionFlags *f, int target_star,
+                         PromoNeed *out, int max)
+{
+    int n = 0;
+    #define NEED(l, m, tm) do { if (n < max) \
+        out[n++] = (PromoNeed){ (l), !!(m), (tm) }; } while (0)
+    int window = promotion_window_open(sim, tower);
     switch (target_star) {
-    case 1: return 1;  /* Starting star, always OK */
-    case 2: return 1;  /* Just need population */
     case 3:
-        /* Need security office (no clock gate at 2->3) */
-        return sim->promo.has_security;
+        /* no clock gate at 2->3 */
+        NEED("A Security office", f->has_security, 0);
+        break;
     case 4:
         /* LevelUp 1148:007e, 3->4 branch (byte-verified 2026-07-09):
          * suite (0xB92B) + recycling adequate (0xB92C) + VIP verdict
@@ -548,27 +560,46 @@ int game_check_promotion(GameSim *sim, Tower *tower, int target_star)
          * window. Metro is NOT required here — the old table had
          * metro/recycling swapped and invented a "4 suites" count; one
          * suite is the requirement. */
-        return sim->promo.has_suite &&
-               sim->promo.recycling_adequate &&
-               sim->promo.medical_adequate &&
-               sim->promo.vip_visited &&
-               promotion_window_open(sim, tower);
+        NEED("A Hotel Suite", f->has_suite, 0);
+        NEED("Recycling keeping up", f->recycling_adequate, 0);
+        NEED("Medical care keeping up", f->medical_adequate, 0);
+        NEED("A favorable VIP visit", f->vip_visited, 0);
+        NEED("On a weekday evening (5PM-7AM)", window, 1);
+        break;
     case 5:
         /* 4->5 branch: metro ([0xB3E8] >= 0) + recycling adequate +
          * medical adequate + the weekday-evening window. NO VIP re-check
          * and no suite re-check — the binary reads neither 0xB923 nor
          * 0xB92B here. */
-        return sim->promo.has_metro &&
-               sim->promo.recycling_adequate &&
-               sim->promo.medical_adequate &&
-               promotion_window_open(sim, tower);
+        NEED("A Metro Station", f->has_metro, 0);
+        NEED("Recycling keeping up", f->recycling_adequate, 0);
+        NEED("Medical care keeping up", f->medical_adequate, 0);
+        NEED("On a weekday evening (5PM-7AM)", window, 1);
+        break;
     case 6:
-        /* TOWER: special event, not automatic */
-        return 0;
+        /* TOWER: the wedding crowns it (game_wedding_start), never the
+         * automatic check — listed for the explainer only. */
+        NEED("A Cathedral", f->has_cathedral, 0);
+        NEED("A wedding: 40 guests reach the Cathedral", sim->wedding.done, 0);
+        break;
     default:
-        return 0;
+        break;   /* 1, 2: population only */
     }
+    #undef NEED
+    return n;
 }
+
+int game_check_promotion(GameSim *sim, Tower *tower, int target_star)
+{
+    if (target_star < 1 || target_star > 5) return 0;   /* TOWER: wedding */
+    PromoNeed needs[PROMO_NEEDS_MAX];
+    int n = game_promotion_needs(sim, tower, &sim->promo, target_star,
+                                 needs, PROMO_NEEDS_MAX);
+    for (int i = 0; i < n; i++)
+        if (!needs[i].met) return 0;
+    return 1;
+}
+
 
 /* --- Tenant state update --- */
 
@@ -1383,6 +1414,11 @@ static ItemType noisy_neighbor_scan(const Tower *tower, const Tenant *room)
         if (gap <= range) return n->type;
     }
     return ITEM_NONE;
+}
+
+ItemType game_noisy_neighbor(const Tower *tower, const Tenant *room)
+{
+    return noisy_neighbor_scan(tower, room);
 }
 
 static int has_noisy_neighbor(const Tower *tower, const Tenant *room)
@@ -2239,11 +2275,16 @@ static void judge_one_unit(GameSim *sim, Tower *tower, Tenant *t)
      * (JudgeT 0630: class 0 +30 / class 2 -30 / class 3 forces 0;
      * noise +60; bars 80 and the star-scaled 150/200). */
     metric = game_tenant_eval_metric(sim, tower, t);
-    int bar = (tower->star_rating >= 4) ? TUNING.judge_stressed
-                                        : TUNING.judge_moderate;
+    int bar = game_judge_bar(tower);
     t->demand_category = metric >= bar ? 0
                        : metric >= DEMAND_HAPPY_BAR ? 1 : 2;
     (void)sim;
+}
+
+int game_judge_bar(const Tower *tower)
+{
+    return (tower->star_rating >= 4) ? TUNING.judge_stressed
+                                     : TUNING.judge_moderate;
 }
 
 /* The live 0-300 "Eval" metric — the number the info dialog draws as its

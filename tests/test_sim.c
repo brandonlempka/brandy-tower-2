@@ -1,12 +1,17 @@
 /* test_sim.c — checks for transport reachability, housekeeping, and the
  * people/elevator pipeline.
  * Build: gcc -o /tmp/test_sim tests/test_sim.c src/tower.c src/game.c \
- *            src/people.c src/twr.c src/sound_hook.c -Isrc -lm
+ *            src/people.c src/twr.c src/sound_hook.c src/touch.c \
+ *            src/hints.c -Isrc -lm
+ *        (macOS: add -include stddef.h — glibc pulls offsetof in for us) 
  * No SDL needed — pure simulation (sound_hook.c is a no-op stub here). */
 #include <stdio.h>
 #include <string.h>
 #include "game.h"
 #include "twr.h"
+#include "view.h"
+#include "touch.h"
+#include "hints.h"
 
 static Tower tw;
 static GameSim sim;
@@ -3727,8 +3732,250 @@ static void test_load_renormalize(void)
     remove("/tmp/ct_test_v14.sav");
 }
 
+/* view.h: zoom steps stay whole-pixel and zooming about a point keeps
+ * the world point under it (BrandyTower camera.ts zoomTo, ported). */
+static void test_view_zoom(void)
+{
+    printf("view zoom:\n");
+    CHECK(VIEW_ZOOM_STEPS[VIEW_ZOOM_DEFAULT] == 1.0f, "default step is 1x");
+    CHECK(view_clamp_zoom_index(-3) == 0 &&
+          view_clamp_zoom_index(99) == VIEW_ZOOM_COUNT - 1, "index clamps");
+    CHECK(view_virtual_extent(960, 0.5f) == 1920, "0.5x doubles the view");
+    CHECK(view_virtual_extent(961, 2.0f) == 481, "2x rounds the view up");
+    CHECK(view_virtual_extent(1000, 3.0f) == 334, "3x covers the last px");
+    CHECK(view_screen_to_virtual(5, 2.0f) == 2 &&
+          view_screen_to_virtual(-1, 2.0f) == -1, "screen->virtual floors");
+
+    int ok = 1;
+    for (int a = 0; a < VIEW_ZOOM_COUNT; a++)
+        for (int b = 0; b < VIEW_ZOOM_COUNT; b++) {
+            float za = VIEW_ZOOM_STEPS[a], zb = VIEW_ZOOM_STEPS[b];
+            int sw = 960, sh = 720, sx = 300, sy = 500;
+            float cx = 1500.0f, cy = -200.0f, nx, ny;
+            view_zoom_about(cx, cy, sw, sh, za, zb, sx, sy, &nx, &ny);
+            float wa = sx / za + cx - view_virtual_extent(sw, za) / 2;
+            float wb = sx / zb + nx - view_virtual_extent(sw, zb) / 2;
+            float ha = sy / za + cy - view_virtual_extent(sh, za) / 2;
+            float hb = sy / zb + ny - view_virtual_extent(sh, zb) / 2;
+            if (fabsf(wa - wb) > 0.01f || fabsf(ha - hb) > 0.01f) ok = 0;
+        }
+    CHECK(ok, "zoom about a point keeps it fixed, every step pair");
+}
+
+/* touch.c gestures (BrandyTower pointer.ts semantics) */
+static struct { int taps, dstart, dmove, dend, dcancel, zin, zout, lp;
+                float pan_x, pan_y; int claim; } tr;
+static void t_tap(void *c, int x, int y) { (void)c; (void)x; (void)y; tr.taps++; }
+static void t_ds(void *c, int x, int y) { (void)c; (void)x; (void)y; tr.dstart++; }
+static void t_dm(void *c, int x, int y) { (void)c; (void)x; (void)y; tr.dmove++; }
+static void t_de(void *c, int x, int y) { (void)c; (void)x; (void)y; tr.dend++; }
+static void t_dc(void *c) { (void)c; tr.dcancel++; }
+static void t_pan(void *c, float dx, float dy) { (void)c; tr.pan_x += dx; tr.pan_y += dy; }
+static void t_zoom(void *c, int d, int x, int y) { (void)c; (void)x; (void)y; if (d > 0) tr.zin++; else tr.zout++; }
+static void t_lp(void *c, int x, int y) { (void)c; (void)x; (void)y; tr.lp++; }
+static int  t_claim(void *c, int x, int y) { (void)c; (void)x; (void)y; return tr.claim; }
+
+static void test_touch(void)
+{
+    printf("touch gestures:\n");
+    TouchHandlers h = { NULL, t_tap, t_ds, t_dm, t_de, t_dc, t_pan, t_zoom, t_lp, t_claim };
+    TouchState s;
+
+    memset(&tr, 0, sizeof tr); touch_reset(&s);
+    touch_down(&s, &h, 1, 100, 100, 0);
+    touch_move(&s, &h, 1, 104, 103);            /* under the threshold */
+    touch_up(&s, &h, 1, 104, 103);
+    CHECK(tr.taps == 1 && tr.dstart == 0 && tr.pan_x == 0, "small wobble is a tap");
+
+    memset(&tr, 0, sizeof tr); touch_reset(&s); tr.claim = 1;
+    touch_down(&s, &h, 1, 100, 100, 0);
+    touch_move(&s, &h, 1, 130, 100);
+    touch_move(&s, &h, 1, 160, 100);
+    touch_up(&s, &h, 1, 160, 100);
+    CHECK(tr.dstart == 1 && tr.dmove == 2 && tr.dend == 1 && tr.taps == 0,
+          "claimed drag builds: start, moves, end, no tap");
+
+    memset(&tr, 0, sizeof tr); touch_reset(&s); tr.claim = 0;
+    touch_down(&s, &h, 1, 100, 100, 0);
+    touch_move(&s, &h, 1, 130, 100);
+    touch_move(&s, &h, 1, 150, 90);
+    touch_up(&s, &h, 1, 150, 90);
+    CHECK(tr.dstart == 0 && tr.pan_x == 50 && tr.pan_y == -10 && tr.taps == 0,
+          "unclaimed drag pans the full distance");
+
+    memset(&tr, 0, sizeof tr); touch_reset(&s); tr.claim = 1;
+    touch_down(&s, &h, 1, 100, 100, 0);
+    touch_move(&s, &h, 1, 140, 100);            /* building... */
+    touch_down(&s, &h, 2, 300, 100, 50);        /* ...second finger */
+    CHECK(tr.dcancel == 1 && tr.dend == 0, "second finger cancels, not commits, a drag");
+    touch_move(&s, &h, 2, 400, 100);            /* spread 160 -> 260 */
+    CHECK(tr.zin == 1 && tr.zout == 0, "pinch out 1.6x = one zoom step in");
+    touch_move(&s, &h, 2, 230, 100);            /* spread -> 90 */
+    CHECK(tr.zout >= 1, "pinch in zooms out");
+    touch_up(&s, &h, 2, 230, 100);
+    int ds0 = tr.dstart; float px0 = tr.pan_x;
+    touch_move(&s, &h, 1, 120, 120);
+    touch_up(&s, &h, 1, 120, 120);
+    CHECK(tr.taps == 0 && tr.dstart == ds0 && tr.pan_x != px0,
+          "finger left after a pinch pans, never taps/builds");
+
+    memset(&tr, 0, sizeof tr); touch_reset(&s);
+    touch_down(&s, &h, 1, 100, 100, 1000);
+    touch_tick(&s, &h, 1300);
+    CHECK(tr.lp == 0, "no long-press before 500ms");
+    touch_tick(&s, &h, 1500);
+    touch_up(&s, &h, 1, 100, 100);
+    CHECK(tr.lp == 1 && tr.taps == 0, "held still 500ms: long-press, no tap");
+}
+
+/* The promotion gate as it was before game_promotion_needs: the needs-
+ * list refactor must agree with it on every flag combination. */
+static int legacy_gate(const PromotionFlags *f, int window, int target_star)
+{
+    switch (target_star) {
+    case 1: return 1;  /* Starting star, always OK */
+    case 2: return 1;  /* Just need population */
+    case 3:
+        /* Need security office (no clock gate at 2->3) */
+        return f->has_security;
+    case 4:
+        /* LevelUp 1148:007e, 3->4 branch (byte-verified 2026-07-09):
+         * suite (0xB92B) + recycling adequate (0xB92C) + VIP verdict
+         * (0xB923) + medical adequate (0xB92D) + the weekday-evening
+         * window. Metro is NOT required here — the old table had
+         * metro/recycling swapped and invented a "4 suites" count; one
+         * suite is the requirement. */
+        return f->has_suite &&
+               f->recycling_adequate &&
+               f->medical_adequate &&
+               f->vip_visited &&
+               window;
+    case 5:
+        /* 4->5 branch: metro ([0xB3E8] >= 0) + recycling adequate +
+         * medical adequate + the weekday-evening window. NO VIP re-check
+         * and no suite re-check — the binary reads neither 0xB923 nor
+         * 0xB92B here. */
+        return f->has_metro &&
+               f->recycling_adequate &&
+               f->medical_adequate &&
+               window;
+    case 6:
+        /* TOWER: special event, not automatic */
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+static int lines_contain(char lines[][HINT_LEN], int n, const char *needle)
+{
+    for (int i = 0; i < n; i++) if (strstr(lines[i], needle)) return 1;
+    return 0;
+}
+
+static void test_hints(void)
+{
+    printf("hints / explainers:\n");
+    char L[HINT_LINES][HINT_LEN];
+
+    /* the refactored gate == the old gate, exhaustively */
+    fresh();
+    int agree = 1;
+    for (int bits = 0; bits < 64; bits++)
+        for (int hour = 0; hour < 24; hour += 6)
+            for (int day = 0; day < 3; day++)
+                for (int target = 1; target <= 6; target++) {
+                    PromotionFlags f = {
+                        .has_security = bits & 1, .has_suite = !!(bits & 2),
+                        .recycling_adequate = !!(bits & 4),
+                        .has_metro = !!(bits & 8),
+                        .medical_adequate = !!(bits & 16),
+                        .vip_visited = !!(bits & 32) };
+                    sim.promo = f;
+                    sim.hour = hour;
+                    tw.day = day;
+                    int window = (hour >= 17 || hour < 7) && !game_is_weekend(&tw);
+                    if (game_check_promotion(&sim, &tw, target) !=
+                        legacy_gate(&f, window, target)) agree = 0;
+                }
+    CHECK(agree, "needs-list gate == pre-refactor gate (all flags/times)");
+
+    /* locked item says when it unlocks; sandbox doesn't */
+    fresh();
+    sim.mode = MODE_CAMPAIGN;
+    tw.star_rating = 1;
+    const char *why = hints_unavailable(&sim, &tw, ITEM_METRO);
+    CHECK(why && strstr(why, "4 stars"), "metro locked: 'Unlocks at 4 stars'");
+    sim.mode = MODE_SANDBOX;
+    CHECK(hints_unavailable(&sim, &tw, ITEM_METRO) == NULL, "sandbox: nothing locked");
+    int n = hints_tool(&sim, &tw, ITEM_ELEVATOR_EXPRESS, L, HINT_LINES);
+    CHECK(n >= 2 && strstr(L[0], "$400,000") &&
+          lines_contain(L, n, "lobby floor"), "express tooltip: price + lobby rule");
+
+    /* pool-full agrees with tower_place */
+    fresh();
+    sim.mode = MODE_SANDBOX;
+    place(ITEM_FLOOR, 0, 100);
+    CHECK(!tower_pool_full(&tw, ITEM_METRO), "no metro yet: pool open");
+    uint16_t m = tower_place(&tw, ITEM_METRO, -3, 105);
+    if (m) {
+        CHECK(tower_pool_full(&tw, ITEM_METRO), "metro built: pool full");
+        CHECK(!tower_place(&tw, ITEM_METRO, -3, 140) &&
+              strstr(tower_reject_reason(), "Only one Metro"),
+              "tower_place refuses the 2nd metro with the original wording");
+        why = hints_unavailable(&sim, &tw, ITEM_METRO);
+        CHECK(why && strstr(why, "One per tower"), "explainer says why");
+    } else {
+        printf("  (metro placement unavailable in fixture: %s)\n", tower_reject_reason());
+    }
+
+    /* rating checklist: 3 stars wants security, ticked when built */
+    fresh();
+    tw.star_rating = 2;
+    n = hints_rating(&sim, &tw, L, HINT_LINES);
+    CHECK(lines_contain(L, n, "\xc3\x97 A Security office"), "2 stars: security unticked");
+    place(ITEM_SECURITY, 1, BX);
+    n = hints_rating(&sim, &tw, L, HINT_LINES);
+    CHECK(lines_contain(L, n, "\xe2\x9c\x93 A Security office"), "security built: ticked");
+    char one[256];
+    hints_next_rating(&sim, &tw, one, sizeof one);
+    CHECK(strstr(one, "3 stars needs") && strstr(one, "population") &&
+          !strstr(one, "Security"), "next-rating line lists only what's missing");
+
+    /* tenant notes */
+    fresh();
+    place(ITEM_FLOOR, 1, BX); place(ITEM_FLOOR, 2, BX);
+    uint16_t lone = place(ITEM_OFFICE, 3, BX);        /* no stairs/lift */
+    run_days(1);
+    Tenant *o = tenant(lone);
+    n = o ? hints_tenant_notes(&sim, &tw, o, L, HINT_LINES) : 0;
+    CHECK(n >= 1 && strstr(L[0], "Nobody can get here"), "unreachable office: connect it");
+
+    fresh();
+    place(ITEM_FLOOR, 1, BX);
+    uint16_t room = place(ITEM_HOTEL_SINGLE, 1, BX);
+    place(ITEM_STAIRS, 0, BX + 20);
+    run_days(1);
+    Tenant *h = tenant(room);
+    if (h) {
+        h->condition = ROOM_DIRTY;
+        n = hints_tenant_notes(&sim, &tw, h, L, HINT_LINES);
+        CHECK(lines_contain(L, n, "no Housekeeping"), "dirty room, no housekeeping: build one");
+        h->condition = ROOM_INFESTED;
+        n = hints_tenant_notes(&sim, &tw, h, L, HINT_LINES);
+        CHECK(lines_contain(L, n, "Demolish"), "infested room: demolish");
+        h->condition = ROOM_CLEAN;
+        h->rent_class = 3;
+        n = hints_tenant_notes(&sim, &tw, h, L, HINT_LINES);
+        CHECK(lines_contain(L, n, "Very Low rent"), "very low rent always satisfies");
+    }
+}
+
 int main(void)
 {
+    test_view_zoom();
+    test_touch();
+    test_hints();
     test_stairs();
     test_flavor();
     test_floor_fill();

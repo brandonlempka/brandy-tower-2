@@ -12,7 +12,8 @@ the faithful port stays the default; mods are opt-in flavor on top.
   pricier). Implementation point: `tower_deck_price()` in src/tower.c —
   one function, already floor-aware.
 
-- **Zoom in/out** (Jonah, 2026-07-29) — the original renders at exactly
+- **Zoom in/out** — SHIPPED 2026-10-31 as whole-step 0.5x-4x zoom
+  (`src/view.h`; README "Modern play"). Original note (Jonah, 2026-07-29) — the original renders at exactly
   one scale (8px cells, 36px floors). Mod: camera zoom levels (integer
   scaling first — 2x out for overview, the minimap already proves the
   tower reads fine small). Touches grid_to_screen/screen_to_grid and
