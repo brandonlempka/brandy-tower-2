@@ -168,7 +168,7 @@ of that script.
 
 ## Modern play
 
-Four deliberate additions over the 1994 game, ported from the sister project
+Deliberate additions over the 1994 game, ported from the sister project
 BrandyTower. They sit on top of the faithful base — at 1x on a 960x720 window
 the frame is byte-identical to the original layout — and change no mechanics.
 
@@ -197,8 +197,27 @@ the frame is byte-identical to the original layout — and change no mechanics.
   functions the simulation decides with (`src/hints.c`) — the star
   checklist and the real promotion gate share one list.
 
+- **Map-view wash** — with the map window on Eval, Rent or Hotel (or View →
+  Eval Overlay, which works even when the minimap is hidden), every room in
+  the main view is washed in the colour the minimap gives it, BrandyTower
+  style: a red column up the tower is a lift problem, a red band across a
+  floor is a noisy neighbour. Shafts, stairs and the lobby stay clear, and
+  the info dialog's picture is never tinted. The minimap's own colours are
+  still the EXE's exact tables (`src/overlay.c`).
+- **Modern UI (optional)** — Options → Modern UI swaps the Win3.1 chrome
+  for dark glass: translucent rounded panels and title strips, pill
+  buttons, a segmented map-view control with a drawn legend, a vector clock
+  and stars, glass menus, tooltips and dialogs, and the toolbox art floating
+  on glass tiles. Every window keeps its exact size and place, so every
+  click lands where it did. Off by default; the web build remembers the
+  choice, and `--ui=modern` / `CT_UI=modern` start in it. The elevator and
+  finance dialogs keep their original bitmap insides inside a glass frame.
+  (`src/ui_skin.c`)
+
 `tests/web/probe_touch.js` drives the gestures on an emulated phone
-(`CHROME=<path> CT_EXE=<SIMTOWER.EXE> node tests/web/probe_touch.js`).
+(`CHROME=<path> CT_EXE=<SIMTOWER.EXE> node tests/web/probe_touch.js`);
+`tests/web/probe_modern_ui.js` flips Modern UI through the real menu and
+checks it survives a relaunch.
 
 ## Status
 

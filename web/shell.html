@@ -113,6 +113,16 @@
   #mutebtn { right: calc(6px + env(safe-area-inset-right, 0px)); }
   #fsbtn { right: calc(52px + env(safe-area-inset-right, 0px)); }
   #mutebtn:hover, #fsbtn:hover { background: rgba(70,70,66,.85); }
+  /* Options -> Modern UI: the HTML corner buttons wear the dark glass too */
+  body.ui-modern #mutebtn, body.ui-modern #fsbtn {
+    opacity: .9; background: rgba(18,22,30,.82); color: #e8ecf2;
+    border: 1px solid rgba(255,255,255,.14); border-radius: 10px;
+    box-shadow: 0 4px 14px rgba(0,0,0,.35);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+  }
+  body.ui-modern #mutebtn:hover, body.ui-modern #fsbtn:hover {
+    background: rgba(40,46,58,.92);
+  }
   a { color: #9eb8b8; }
   /* Emscripten's SDL maps mouse/touch coords through the CSS size. */
   #canvaswrap canvas {
@@ -1125,6 +1135,13 @@
   /* Engine hook: game.c notify_star_up() reports each star promotion
    * with the tower-day it landed, so the dashboard can chart the
    * star funnel (filter "star-") and when stars are typically hit. */
+  /* Engine hook: Options -> Modern UI flipped (main.c set_ui_modern).
+   * Remembered across launches; the next boot passes --ui=modern. */
+  window.ctUiEvent = function (modern) {
+    try { localStorage.setItem('ct-ui', modern ? 'modern' : 'classic'); }
+    catch (e) {}
+    document.body.classList.toggle('ui-modern', !!modern);
+  };
   window.ctStarEvent = function (star, day) {
     ctEvent('star-' + (star >= 6 ? 'tower' : star) + '/d' + day);
     ctRoster({ s: star, d: day });
@@ -1299,6 +1316,12 @@
       var v = fitView();
       args.push('--view=' + v.w + 'x' + v.h);
       if (window.matchMedia('(pointer: coarse)').matches) args.push('--zoom=2');
+      var ui = null;
+      try { ui = localStorage.getItem('ct-ui'); } catch (e) {}
+      if (ui === 'modern') {
+        args.push('--ui=modern');
+        document.body.classList.add('ui-modern');
+      }
       Module.engineStarted = true;
       Module.callMain(args);
       Module.canvas.focus();
@@ -1336,6 +1359,22 @@
     Module.canvas.focus();     /* give the keys back to the tower */
   });
   document.addEventListener('visibilitychange', applyAudioGate);
+
+  /* Save when the tab goes to the background or is closed. 'hidden' is
+   * the last moment a browser reliably gives us (mobile Safari never
+   * fires unload, and IDB writes started in pagehide may not land), so
+   * it's the main trigger; pagehide is a best-effort backstop. The
+   * engine skips the write if nothing changed since the last save, and
+   * otherwise also autosaves every two minutes of real time. */
+  function saveOnLeave() {
+    if (document.getElementById('canvaswrap').style.display !== 'block') return;
+    try { Module.ccall('ct_autosave', null, [], []); }
+    catch (e) { console.warn('autosave on leave failed', e); }
+  }
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) saveOnLeave();
+  });
+  window.addEventListener('pagehide', saveOnLeave);
 
   document.getElementById('fsbtn').addEventListener('click', function () {
     var wrap = document.getElementById('canvaswrap');

@@ -20,15 +20,20 @@ the faithful port stays the default; mods are opt-in flavor on top.
   every hit-test that assumes CELL_W/CELL_H; consider a global
   view-scale factor those helpers own.
 
-- **Finer speed control** (Jonah, 2026-07-29) — the original's only
-  speed control is Options → Fast Mode (removes the 6ms tick throttle;
-  menu id 40007 → [0xDE34] → TimeT 1200:01a5), i.e. pause / throttled /
-  unthrottled. The base game now matches: Paused / Normal / Fast Mode,
-  with Fast capped at 2x normal as an era-hardware approximation
-  (a 1994 machine unthrottled wasn't much faster than that; a Pi 5
-  unthrottled would be a time-lapse). Mod: extra tiers (the old Turbo
-  = 6x still exists in the enum, UI-unreachable), or a free-form
-  speed slider.
+- **Modern UI skin** — SHIPPED 2026-10-31 (requested that day): an opt-in
+  dark-glass skin over the faithful Win3.1 chrome (Options → Modern UI;
+  `src/ui_skin.c`, README "Modern play"). Same rects and hit-tests; the
+  classic frame is untouched. Shipped with it: the main-view map-view wash
+  (Eval/Rent/Hotel tint the rooms, BrandyTower style; `src/overlay.c`).
+
+- **Finer speed control** (Jonah, 2026-07-29) — **done 2026-10-31**,
+  brought over from brandytower. The original's only speed control is
+  Options → Fast Mode (removes the 6ms tick throttle; menu id 40007 →
+  [0xDE34] → TimeT 1200:01a5), i.e. pause / throttled / unthrottled.
+  The port now has Paused / 1x / 2x / 3x / Fast Mode, paced on the wall
+  clock (1x = 15 ticks/s; Fast Mode ~1000 ticks/s within a 10ms-per-frame
+  sim budget), in the Speed menu, a hideable Speed window (Windows →
+  Speed Window), and Space / + / - / F. A free-form slider is still open.
 
 - **Deliberate multi-tower gaps** (older note in tower.c) — the
   original forbids horizontal gaps in a floor (deck is one contiguous

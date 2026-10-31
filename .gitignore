@@ -12,3 +12,4 @@ tests/web/out/
 decomp-work/
 tests/web/out-probe/
 tests/web/out-touch/
+tests/web/out-modern/
