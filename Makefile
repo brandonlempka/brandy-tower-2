@@ -51,6 +51,18 @@ web:
 	  --shell-file $(WEBDIR)/.shell.gen.html \
 	  --embed-file web/fonts@/fonts
 	rm -f $(WEBDIR)/.shell.gen.html
+	# Cache-bust: stamp index.js / index.wasm URLs with a hash of both, so a
+	# browser can never pair a cached glue with a fresh wasm (EM_ASM table
+	# mismatch -> "ASM_CONSTS[emAsmAddr] is not a function").
+	@V=$$(cat $(WEBDIR)/index.js $(WEBDIR)/index.wasm | cksum | cut -d' ' -f1); \
+	sed -i.bak -e "s/__CT_ASSET_V__/$$V/g" \
+	    -e "s/src=index\.js>/src=\"index.js?v=$$V\">/" \
+	    -e "s/src=\"index\.js\"/src=\"index.js?v=$$V\"/" \
+	    $(WEBDIR)/index.html && rm -f $(WEBDIR)/index.html.bak; \
+	grep -q "index.js?v=$$V" $(WEBDIR)/index.html && \
+	! grep -q "__CT_ASSET_V__" $(WEBDIR)/index.html || \
+	  { echo "web: asset version stamp failed" >&2; exit 1; }; \
+	echo "web: assets stamped v=$$V"
 
 webserve: web
 	@echo "Serving on http://$$(hostname -I | cut -d' ' -f1):8611 (and Tailscale IP)"

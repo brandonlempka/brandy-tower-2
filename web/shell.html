@@ -1262,7 +1262,17 @@
     }, { passive: false });
   });
 
+  /* Build stamp: the Makefile replaces __CT_ASSET_V__ with a hash of the
+   * built index.js + index.wasm, so a page can only ever pair a JS glue
+   * with ITS wasm. (A stale cached index.js running a fresh index.wasm —
+   * or the reverse — dies at the first EM_ASM call with "ASM_CONSTS
+   * [emAsmAddr] is not a function", since every EM_ASM is an index into
+   * the glue's table; 2026-10-31.) */
+  var CT_ASSET_V = '__CT_ASSET_V__';
   var Module = {
+    locateFile: function (path, prefix) {
+      return prefix + path + (/^__/.test(CT_ASSET_V) ? '' : '?v=' + CT_ASSET_V);
+    },
     canvas: document.getElementById('canvas'),
     noInitialRun: true,
     preRun: [function () {
