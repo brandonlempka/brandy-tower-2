@@ -2,7 +2,10 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" id="viewportmeta" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#161616">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <title>ConciliaTower - Play SimTower in the browser</title>
 <meta name="description" content="Play SimTower (1994) in your web browser. Bring your own SIMTOWER.EXE — parsed client-side, nothing uploaded.">
 <meta property="og:title" content="ConciliaTower">
@@ -84,31 +87,43 @@
             margin-top: 10px; text-align: left; }
   #hashnote { font-size: 13px; color: #d8a95c; margin: 6px auto 0;
               display: none; text-align: left; }
-  #canvaswrap { display: none; position: relative; }
+  /* Playing: the canvas fills the window (inside the notch/home-bar safe
+   * areas). Its backing store is the engine's logical size and its CSS
+   * size is set by fitView() so each logical pixel is a WHOLE number of
+   * device pixels — crisp art on any screen, phone to 5K. !important
+   * beats the inline size SDL writes on SDL_SetWindowSize. */
+  #canvaswrap { display: none; position: fixed; inset: 0; background: #000;
+                touch-action: none; overscroll-behavior: none;
+                -webkit-user-select: none; user-select: none;
+                -webkit-touch-callout: none; }
+  body.playing { overflow: hidden; overscroll-behavior: none; }
   canvas {
     display: block; image-rendering: pixelated;
     border: 1px solid #333; background: #000;
   }
+  /* Bottom-right: the top edge belongs to the Win3.1 menu bar. */
   #mutebtn, #fsbtn {
-    position: absolute; top: 6px; z-index: 5;
+    position: absolute; z-index: 5;
+    bottom: calc(6px + env(safe-area-inset-bottom, 0px));
+    opacity: .7;
     background: rgba(20,20,20,.75); color: #d8d8d4;
     border: 1px solid #3a3a36; border-radius: 5px;
     padding: 4px 10px; font-size: 14px; cursor: pointer;
   }
-  #mutebtn { right: 6px; }
-  #fsbtn { right: 52px; }
+  #mutebtn { right: calc(6px + env(safe-area-inset-right, 0px)); }
+  #fsbtn { right: calc(52px + env(safe-area-inset-right, 0px)); }
   #mutebtn:hover, #fsbtn:hover { background: rgba(70,70,66,.85); }
   a { color: #9eb8b8; }
-  /* Keep the tower on screen on small windows; fill (integer-ish) in
-   * fullscreen. Emscripten's SDL maps mouse coords through the CSS size. */
-  #canvaswrap canvas { max-width: 100vw; height: auto; }
-  #canvaswrap:fullscreen {
-    display: flex; align-items: center; justify-content: center;
-    background: #000;
+  /* Emscripten's SDL maps mouse/touch coords through the CSS size. */
+  #canvaswrap canvas {
+    position: absolute; border: 0; touch-action: none;
+    left: env(safe-area-inset-left, 0px); top: env(safe-area-inset-top, 0px);
+    width: var(--ct-css-w, 960px) !important;
+    height: var(--ct-css-h, 720px) !important;
   }
-  #canvaswrap:fullscreen canvas {
-    width: min(100vw, calc(100vh * 4 / 3)); height: auto; border: 0;
-  }
+  #safeprobe { position: fixed; visibility: hidden; pointer-events: none;
+    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+             env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px); }
   #towers { margin: 12px 0 4px; text-align: left; }
   #towers h2 { font-size: 15px; letter-spacing: 1px; color: #d8d1c6;
                margin: 0 0 8px; font-weight: normal;
@@ -294,6 +309,7 @@
             rel="noopener">discord</a></p>
     </div>
   </div>
+  <div id="safeprobe"></div>
   <div id="canvaswrap">
     <button id="fsbtn" title="Fullscreen">&#x26F6;</button>
     <button id="mutebtn" title="Mute sound">&#128266;</button>
@@ -1125,6 +1141,98 @@
   window.ctDayEvent = function (day, pop, star, money) {
     ctRoster({ n: currentSlot, d: day, p: pop, s: star, m: money });
   };
+  /* ---- Responsive canvas (BrandyTower port) ----
+   * k = device pixels per logical pixel. Ideally the screen's density
+   * (one logical px per CSS px, like any desktop app), capped so the
+   * logical view keeps MIN_VIEW px on its short side — the Win3.1 info
+   * bar alone is 431px wide. A whole k keeps every art pixel identical,
+   * so round down to one when that shrinks the UI by no more than 25%;
+   * otherwise keep the fractional k (on a 2x+ phone the uneven pixel
+   * widths are below what the eye resolves).
+   *   iPhone 390x844@3  -> k=2,    logical 585x1266
+   *   Android 412x915@2 -> k=1.72, logical 480x1066
+   *   desktop @1 / @2   -> k=1 / 2, logical = CSS size */
+  var MIN_VIEW = 480;
+  function safeInsets() {
+    var cs = getComputedStyle(document.getElementById('safeprobe'));
+    return { t: parseFloat(cs.paddingTop) || 0, r: parseFloat(cs.paddingRight) || 0,
+             b: parseFloat(cs.paddingBottom) || 0, l: parseFloat(cs.paddingLeft) || 0 };
+  }
+  function computeView() {
+    var vv = window.visualViewport;
+    var ins = safeInsets();
+    var cssW = (vv ? vv.width : window.innerWidth) - ins.l - ins.r;
+    var cssH = (vv ? vv.height : window.innerHeight) - ins.t - ins.b;
+    var dpr = window.devicePixelRatio || 1;
+    var devW = Math.floor(cssW * dpr), devH = Math.floor(cssH * dpr);
+    var k = Math.max(1, Math.min(dpr, Math.min(devW, devH) / MIN_VIEW));
+    if (Math.floor(k) >= 1 && Math.floor(k) / k >= 0.75) k = Math.floor(k);
+    var w = Math.max(320, Math.floor(devW / k));
+    var h = Math.max(240, Math.floor(devH / k));
+    return { w: w, h: h, cssW: w * k / dpr, cssH: h * k / dpr };
+  }
+  var lastView = null;
+  function fitView() {
+    var v = computeView();
+    var root = document.documentElement.style;
+    root.setProperty('--ct-css-w', v.cssW + 'px');
+    root.setProperty('--ct-css-h', v.cssH + 'px');
+    if (Module.engineStarted &&
+        (!lastView || lastView.w !== v.w || lastView.h !== v.h))
+      Module.ccall('ct_set_view', null, ['number', 'number'], [v.w, v.h]);
+    lastView = v;
+    return v;
+  }
+  var fitTimer = 0;
+  function fitSoon() {     /* rotation/resize fire in bursts */
+    clearTimeout(fitTimer);
+    fitTimer = setTimeout(fitView, 60);
+  }
+  window.addEventListener('resize', fitSoon);
+  window.addEventListener('orientationchange', fitSoon);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', fitSoon);
+  document.addEventListener('fullscreenchange', fitSoon);
+
+  /* Canvas pixel under a client point, in the engine's logical pixels. */
+  function canvasPoint(ev) {
+    var c = Module.canvas, r = c.getBoundingClientRect();
+    return { x: Math.round((ev.clientX - r.left) * c.width / r.width),
+             y: Math.round((ev.clientY - r.top) * c.height / r.height) };
+  }
+
+  /* Trackpad pinch and Ctrl/Cmd+wheel zoom (BrandyTower pointer.ts): a
+   * pinch arrives as wheel events with ctrlKey and small deltas, a mouse
+   * notch as ~100px. Accumulate to one step per 100px, reset after a
+   * 200ms pause, and leave 200ms between steps so a momentum tail can't
+   * run the zoom from one end to the other. Plain wheel still scrolls. */
+  var WHEEL_STEP = 100, PINCH_SCALE = 4, WHEEL_IDLE = 200, WHEEL_GAP = 200;
+  var wheelTravel = 0, lastWheel = 0, lastWheelStep = 0;
+  document.getElementById('canvas').addEventListener('wheel', function (ev) {
+    if (!(ev.ctrlKey || ev.metaKey)) return;     /* SDL handles scrolling */
+    ev.preventDefault();
+    ev.stopImmediatePropagation();               /* not also an SDL wheel */
+    var unit = ev.deltaMode === 1 ? 40 : ev.deltaMode === 2 ? 800 : 1;
+    var d = ev.deltaY * unit * (ev.ctrlKey ? PINCH_SCALE : 1);
+    var now = ev.timeStamp;
+    if (now - lastWheel > WHEEL_IDLE || Math.sign(d) !== Math.sign(wheelTravel))
+      wheelTravel = 0;
+    lastWheel = now;
+    wheelTravel += d;
+    if (Math.abs(wheelTravel) < WHEEL_STEP || now - lastWheelStep < WHEEL_GAP) return;
+    lastWheelStep = now;
+    var dir = wheelTravel < 0 ? 1 : -1;
+    wheelTravel = 0;
+    var p = canvasPoint(ev);
+    Module.ccall('ct_zoom_step', null, ['number', 'number', 'number'], [dir, p.x, p.y]);
+  }, { passive: false, capture: true });
+
+  /* iOS Safari: no page pinch / double-tap zoom over the game. */
+  ['gesturestart', 'gesturechange', 'gestureend'].forEach(function (t) {
+    document.addEventListener(t, function (ev) {
+      if (document.body.classList.contains('playing')) ev.preventDefault();
+    }, { passive: false });
+  });
+
   var Module = {
     canvas: document.getElementById('canvas'),
     noInitialRun: true,
@@ -1170,6 +1278,16 @@
       try { localStorage.setItem('ct-slot', currentSlot); } catch (e) {}
       document.getElementById('stage').style.display = 'none';
       document.getElementById('canvaswrap').style.display = 'block';
+      document.body.classList.add('playing');
+      document.getElementById('viewportmeta').setAttribute('content',
+        'width=device-width, initial-scale=1, maximum-scale=1, ' +
+        'user-scalable=no, viewport-fit=cover');
+      /* The engine opens at the size that fits this window; touch-first
+       * devices open at 2x so a floor is big enough for a thumb. */
+      var v = fitView();
+      args.push('--view=' + v.w + 'x' + v.h);
+      if (window.matchMedia('(pointer: coarse)').matches) args.push('--zoom=2');
+      Module.engineStarted = true;
       Module.callMain(args);
       Module.canvas.focus();
     };

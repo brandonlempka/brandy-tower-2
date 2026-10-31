@@ -504,6 +504,14 @@ typedef struct {
 
     /* Window dragging state */
     int             win_dragging;    /* 0=none, 1=info, 2=map, 3=toolbox */
+    int             win_moved;       /* player-dragged: 1=info 2=map 4=toolbox;
+                                      * layout_windows leaves those in place */
+    int             narrow_layout;   /* last layout was phone-narrow */
+    int             px_scale;        /* native HiDPI: device px per logical px */
+    /* Requests from the web shell (ct_set_view / ct_zoom_step), applied at
+     * the top of the next frame so JS never re-enters SDL mid-ASYNCIFY. */
+    int             pending_view_w, pending_view_h;
+    int             pending_zoom, pending_zoom_x, pending_zoom_y;
     int             win_drag_ox;     /* Mouse offset from window origin at drag start */
     int             win_drag_oy;
     
@@ -792,9 +800,58 @@ static const TopMenu top_menus[] = {
  * the bar hit-test and the dropdown anchor all use it. They used to
  * disagree (8 vs 7 px/char) and the dropdowns drifted right by one pixel
  * per character of every label before them (Jonah, 2026-09-11). */
+/* Narrow screens (phones): the 1994 bar is ~724px at full padding. The
+ * padding shrinks to fit, and below that the three long labels take
+ * short forms, so the bar fits down to ~450 logical px. Wide screens
+ * keep the original spacing exactly. */
+static int menu_bar_natural_chars(int shortened)
+{
+    int n = 0;
+    for (int i = 0; i < TOP_MENU_COUNT; i++) {
+        const char *l = top_menus[i].label;
+        if (shortened && !strcmp(l, "Build Res.")) l = "Res.";
+        if (shortened && !strcmp(l, "Build Com.")) l = "Com.";
+        if (shortened && !strcmp(l, "Transport"))  l = "Trans.";
+        n += (int)strlen(l);
+    }
+    return n;
+}
+
+static int menu_bar_shortened(void)
+{
+    return 8 + menu_bar_natural_chars(0) * 7 + TOP_MENU_COUNT * 2 * 4
+           > game.screen_w;
+}
+
+static int menu_item_pad(void)
+{
+    int chars = menu_bar_natural_chars(menu_bar_shortened());
+    int pad = (game.screen_w - 8 - chars * 7) / (TOP_MENU_COUNT * 2);
+    return pad > MENU_ITEM_PAD ? MENU_ITEM_PAD : pad < 2 ? 2 : pad;
+}
+
+static const char *top_menu_label(int i)
+{
+    const char *l = top_menus[i].label;
+    if (menu_bar_shortened()) {
+        if (!strcmp(l, "Build Res.")) return "Res.";
+        if (!strcmp(l, "Build Com.")) return "Com.";
+        if (!strcmp(l, "Transport"))  return "Trans.";
+    }
+    return l;
+}
+
 static int top_menu_width(int i)
 {
-    return (int)strlen(top_menus[i].label) * 7 + MENU_ITEM_PAD * 2;
+    return (int)strlen(top_menu_label(i)) * 7 + menu_item_pad() * 2;
+}
+
+/* A dropdown is 180px wide; keep it on screen under a right-hand menu. */
+static int dropdown_x(int menu_x)
+{
+    int x = menu_x;
+    if (x + 180 > game.screen_w) x = game.screen_w - 180;
+    return x < 0 ? 0 : x;
 }
 
 /* Get pixel position of top menu item */
@@ -1043,6 +1100,24 @@ static void zoom_step(int dir, int sx, int sy)
 static void zoom_step_center(int dir)
 {
     zoom_step(dir, game.screen_w / 2, game.screen_h / 2);
+}
+
+static void update_px_scale(void);            /* responsive layout, below */
+static void apply_view_size(int w, int h);
+
+/* Read the presented frame into a new surface sized to the renderer's
+ * OUTPUT (device pixels — larger than screen_w x screen_h on a HiDPI
+ * display), so the readback can never overrun the buffer. */
+static SDL_Surface *read_screen_surface(void)
+{
+    int ow = game.screen_w, oh = game.screen_h;
+    SDL_GetRendererOutputSize(game.renderer, &ow, &oh);
+    SDL_Surface *sshot = SDL_CreateRGBSurface(0, ow, oh, 32,
+        0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
+    if (sshot)
+        SDL_RenderReadPixels(game.renderer, NULL, SDL_PIXELFORMAT_ARGB8888,
+                             sshot->pixels, sshot->pitch);
+    return sshot;
 }
 
 /* ---------- HUD text rendering helpers ---------- */
@@ -5512,15 +5587,15 @@ static void render_menu_bar(void)
             SDL_SetRenderDrawColor(game.renderer, WIN31_SEL_BG, 255);
             SDL_Rect sel = { cx, bar_y + 1, tw, MENU_BAR_H - 2 };
             SDL_RenderFillRect(game.renderer, &sel);
-            draw_menu_text(top_menus[i].label, cx + MENU_ITEM_PAD, bar_y + 3, 1);
+            draw_menu_text(top_menu_label(i), cx + menu_item_pad(), bar_y + 3, 1);
         } else if (is_hover) {
             /* Slight highlight on hover */
             SDL_SetRenderDrawColor(game.renderer, 220, 220, 220, 255);
             SDL_Rect hl = { cx, bar_y + 1, tw, MENU_BAR_H - 2 };
             SDL_RenderFillRect(game.renderer, &hl);
-            draw_menu_text(top_menus[i].label, cx + MENU_ITEM_PAD, bar_y + 3, 0);
+            draw_menu_text(top_menu_label(i), cx + menu_item_pad(), bar_y + 3, 0);
         } else {
-            draw_menu_text(top_menus[i].label, cx + MENU_ITEM_PAD, bar_y + 3, 0);
+            draw_menu_text(top_menu_label(i), cx + menu_item_pad(), bar_y + 3, 0);
         }
         cx += tw;
     }
@@ -5536,7 +5611,7 @@ static void render_dropdown(void)
     int mx, my, mw, mh;
     get_top_menu_rect(game.menu_open, &mx, &my, &mw, &mh);
     
-    int drop_x = mx;
+    int drop_x = dropdown_x(mx);
     int drop_y = my + MENU_BAR_H;
     int drop_w = 180;
     int item_h = 18;
@@ -8885,7 +8960,7 @@ static int dropdown_hit_test(int mx, int my)
     
     int dx, dy, dw, dh;
     get_top_menu_rect(game.menu_open, &dx, &dy, &dw, &dh);
-    int drop_x = dx;
+    int drop_x = dropdown_x(dx);
     int drop_y = dy + MENU_BAR_H;
     int drop_w = 180;
     int item_h = 18;
@@ -9019,11 +9094,8 @@ static void execute_menu_item(const MenuItem *item)
     case ACT_SPEED_3:     game.sim.speed = SPEED_TURBO;   break;
     case ACT_DEBUG_TOGGLE: game.show_debug = !game.show_debug; break;
     case ACT_SCREENSHOT: {
-        SDL_Surface *sshot = SDL_CreateRGBSurface(0, game.screen_w, game.screen_h, 32,
-            0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
-        SDL_RenderReadPixels(game.renderer, NULL, SDL_PIXELFORMAT_ARGB8888,
-                             sshot->pixels, sshot->pitch);
-        SDL_SaveBMP(sshot, "/tmp/simtower_screenshot.bmp");
+        SDL_Surface *sshot = read_screen_surface();
+        if (sshot) SDL_SaveBMP(sshot, "/tmp/simtower_screenshot.bmp");
         SDL_FreeSurface(sshot);
         printf("Screenshot saved\n");
         break;
@@ -9454,11 +9526,8 @@ static void handle_event(SDL_Event *ev)
         
         /* Screenshot */
         case SDLK_F12: {
-            SDL_Surface *sshot = SDL_CreateRGBSurface(0, game.screen_w, game.screen_h, 32,
-                0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
-            SDL_RenderReadPixels(game.renderer, NULL, SDL_PIXELFORMAT_ARGB8888,
-                                 sshot->pixels, sshot->pitch);
-            SDL_SaveBMP(sshot, "/tmp/simtower_screenshot.bmp");
+            SDL_Surface *sshot = read_screen_surface();
+            if (sshot) SDL_SaveBMP(sshot, "/tmp/simtower_screenshot.bmp");
             SDL_FreeSurface(sshot);
             printf("Screenshot saved to /tmp/simtower_screenshot.bmp\n");
             break;
@@ -9557,6 +9626,7 @@ static void handle_event(SDL_Event *ev)
                 if (ny + INFO_BAR_H > game.screen_h) ny = game.screen_h - INFO_BAR_H;
                 game.info_x = nx;
                 game.info_y = ny;
+                game.win_moved |= 1;
                 break;
             case 2: /* Minimap */
                 if (nx < 0) nx = 0;
@@ -9565,6 +9635,7 @@ static void handle_event(SDL_Event *ev)
                 if (ny + MAP_WIN_H > game.screen_h) ny = game.screen_h - MAP_WIN_H;
                 game.map_x = nx;
                 game.map_y = ny;
+                game.win_moved |= 2;
                 break;
             case 3: /* Toolbox */
                 if (nx < 0) nx = 0;
@@ -9573,6 +9644,7 @@ static void handle_event(SDL_Event *ev)
                 if (ny + TOOL_WIN_H > game.screen_h) ny = game.screen_h - TOOL_WIN_H;
                 game.tool_x = nx;
                 game.tool_y = ny;
+                game.win_moved |= 4;
                 break;
             case 4: /* Elevator dialog */
                 if (nx < 0) nx = 0;
@@ -9993,9 +10065,9 @@ static void handle_event(SDL_Event *ev)
         /* Web canvas is fixed 960x720 — browser-side CSS resize events
          * must never shrink the game's render size. */
         if (ev->window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-            game.screen_w = ev->window.data1;
-            game.screen_h = ev->window.data2;
-            update_view_size();
+            int nw = ev->window.data1, nh = ev->window.data2;
+            update_px_scale();
+            apply_view_size(nw, nh);
         }
 #endif
         break;
@@ -10119,6 +10191,137 @@ static void snd_tally_dump(void)
  * audio device, records the sim's sounds, and writes a WAV at exit. */
 static int g_sound_capture = 0;
 
+/* ---------- Responsive layout (port addition) ----------
+ * The original's windows sit at fixed spots on a 640x480+ desktop. The
+ * port's view now follows the browser window, so place them for the size
+ * we actually have: faithful defaults wherever they fit, then fall-backs
+ * for phones, and finally clamp everything on screen. Windows the player
+ * dragged keep their spot (clamped). */
+static void clamp_win(int *x, int *y, int w, int h)
+{
+    if (*x + w > game.screen_w) *x = game.screen_w - w;
+    if (*y + h > game.screen_h) *y = game.screen_h - h;
+    if (*x < 0) *x = 0;
+    if (*y < MENU_BAR_H) *y = MENU_BAR_H;
+}
+
+static void layout_windows(void)
+{
+    int W = game.screen_w;
+    int info_h = WIN_TITLEBAR_H + INFO_BAR_H;
+    /* Map and info bar can't share the top row below this width. */
+    int narrow = W < MAP_WIN_W + INFO_BAR_W + 8;
+    if (narrow && !game.narrow_layout)
+        game.win_map = 0;        /* phones start without the minimap; the
+                                  * Windows menu still shows it */
+    else if (!narrow && game.narrow_layout)
+        game.win_map = 1;
+    game.narrow_layout = narrow;
+
+    if (!(game.win_moved & 1)) {
+        game.info_x = W - INFO_BAR_W;
+        game.info_y = MENU_BAR_H;
+    }
+    if (!(game.win_moved & 2)) {
+        game.map_x = 0;
+        game.map_y = MENU_BAR_H;
+        /* narrow but shown anyway: under the info bar, not behind it */
+        if (narrow) game.map_y = MENU_BAR_H + info_h;
+    }
+    if (!(game.win_moved & 4)) {
+        int th = tool_win_height();
+        int top = MENU_BAR_H;
+        /* info bar overlapping the toolbox column pushes it down */
+        if (game.win_infobar && game.info_x < TOOL_WIN_W) top += info_h;
+        game.tool_x = 0;
+        game.tool_y = game.win_map ? game.map_y + MAP_WIN_H : top;
+        /* too short to stack under the map (landscape phones): beside it */
+        if (game.tool_y + th > game.screen_h && game.win_map) {
+            game.tool_x = MAP_WIN_W;
+            game.tool_y = top;
+        }
+    }
+    clamp_win(&game.info_x, &game.info_y, INFO_BAR_W, info_h);
+    clamp_win(&game.map_x, &game.map_y, MAP_WIN_W, MAP_WIN_H);
+    clamp_win(&game.tool_x, &game.tool_y, TOOL_WIN_W, tool_win_height());
+    clamp_win(&game.elv_x, &game.elv_y, ELV_W, WIN_TITLEBAR_H);
+    clamp_win(&game.fin_x, &game.fin_y, FIN_DLG_W, WIN_TITLEBAR_H);
+}
+
+/* Native HiDPI (macOS Retina): the renderer's output is k x the window's
+ * logical size; draw in logical pixels at an integer scale so the art
+ * stays whole-pixel. Web does this in the shell (canvas CSS size). */
+static void update_px_scale(void)
+{
+    int ww = game.screen_w, ow = ww, oh;
+    SDL_GetWindowSize(game.window, &ww, NULL);
+    SDL_GetRendererOutputSize(game.renderer, &ow, &oh);
+    int k = ww > 0 ? ow / ww : 1;
+    if (k < 1) k = 1;
+    game.px_scale = k;
+    SDL_RenderSetScale(game.renderer, (float)k, (float)k);
+}
+
+/* A new logical view size (window resize, rotation, fullscreen). */
+static void apply_view_size(int w, int h)
+{
+    if (w < 320) w = 320;
+    if (h < 240) h = 240;
+    if (w == game.screen_w && h == game.screen_h) return;
+    game.screen_w = w;
+    game.screen_h = h;
+    update_view_size();
+    layout_windows();
+    clamp_camera();
+}
+
+static void apply_pending_requests(void)
+{
+    if (game.pending_view_w > 0 && game.pending_view_h > 0) {
+        int w = game.pending_view_w, h = game.pending_view_h;
+        game.pending_view_w = game.pending_view_h = 0;
+        SDL_SetWindowSize(game.window, w, h);
+        apply_view_size(w, h);
+    }
+    /* Re-place the windows whenever an input to the layout changes — the
+     * toolbox grows with the star rating, windows are shown/hidden from
+     * the Windows menu, a load swaps the tower under us. */
+    {
+        static int sig[7];
+        int now[7] = { game.screen_w, game.screen_h, tool_win_height(),
+                       game.win_map, game.win_infobar, game.win_toolbar,
+                       game.win_moved };
+        if (memcmp(sig, now, sizeof now)) {
+            memcpy(sig, now, sizeof now);
+            layout_windows();
+        }
+    }
+    while (game.pending_zoom) {
+        int d = game.pending_zoom > 0 ? 1 : -1;
+        game.pending_zoom -= d;
+        zoom_step(d, game.pending_zoom_x, game.pending_zoom_y);
+    }
+}
+
+#ifdef __EMSCRIPTEN__
+/* Shell -> engine: the logical canvas size it picked for this viewport
+ * (integer device px per logical px; see web/shell.html fitView). */
+EMSCRIPTEN_KEEPALIVE void ct_set_view(int w, int h)
+{
+    game.pending_view_w = w;
+    game.pending_view_h = h;
+}
+
+/* Shell -> engine: one zoom step about a logical canvas point (trackpad
+ * pinch / Ctrl+wheel, accumulated in the shell like BrandyTower's). */
+EMSCRIPTEN_KEEPALIVE void ct_zoom_step(int dir, int x, int y)
+{
+    game.pending_zoom += dir > 0 ? 1 : -1;
+    game.pending_zoom_x = x;
+    game.pending_zoom_y = y;
+}
+#endif
+
 int main(int argc, char *argv[])
 {
     const char *exe_path = NULL;
@@ -10225,9 +10428,25 @@ int main(int argc, char *argv[])
     
     game.screen_w = WINDOW_W;
     game.screen_h = WINDOW_H;
+    /* The web shell sizes the canvas to the browser window and passes the
+     * logical size in (CT_VIEW_W/H); native keeps the original 960x720. */
+    {
+        int vw = 0, vh = 0;
+        if (getenv("CT_VIEW_W") && getenv("CT_VIEW_H")) {
+            vw = atoi(getenv("CT_VIEW_W"));
+            vh = atoi(getenv("CT_VIEW_H"));
+        }
+        for (int i = 1; i < argc; i++)            /* --view=WxH (web shell) */
+            if (!strncmp(argv[i], "--view=", 7))
+                sscanf(argv[i] + 7, "%dx%d", &vw, &vh);
+        if (vw >= 320 && vh >= 240) { game.screen_w = vw; game.screen_h = vh; }
+    }
     game.zoom_idx = VIEW_ZOOM_DEFAULT;
     update_view_size();
     Uint32 wflags = SDL_WINDOW_SHOWN;
+#if !defined(__EMSCRIPTEN__)
+    if (!auto_screenshot) wflags |= SDL_WINDOW_ALLOW_HIGHDPI;
+#endif
 #ifndef __EMSCRIPTEN__
     /* Fixed canvas on the web: under Emscripten RESIZABLE binds the
      * window to the canvas's CSS box, whose transition fired a
@@ -10237,7 +10456,7 @@ int main(int argc, char *argv[])
 #endif
     game.window = SDL_CreateWindow("ConciliaTower",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        WINDOW_W, WINDOW_H, wflags);
+        game.screen_w, game.screen_h, wflags);
     
     /* Software renderer for VNC visibility */
 #ifdef __EMSCRIPTEN__
@@ -10249,9 +10468,20 @@ int main(int argc, char *argv[])
     game.renderer = SDL_CreateRenderer(game.window, -1,
         SDL_RENDERER_ACCELERATED | SDL_RENDERER_TARGETTEXTURE);
     if (!game.renderer)
+#elif defined(__APPLE__)
+    /* macOS dev builds: Metal for crisp Retina output (the Pi service
+     * below keeps the software renderer). */
+    if (!auto_screenshot)
+        game.renderer = SDL_CreateRenderer(game.window, -1,
+            SDL_RENDERER_ACCELERATED | SDL_RENDERER_TARGETTEXTURE);
+    if (!game.renderer)
 #endif
     /* Native stays software: the service runs under Xvfb/VNC with no GPU. */
     game.renderer = SDL_CreateRenderer(game.window, -1, SDL_RENDERER_SOFTWARE);
+
+#ifndef __EMSCRIPTEN__
+    update_px_scale();   /* Retina: draw logical px at an integer scale */
+#endif
 
     /* Replace the bare X-server root cursor with a proper arrow; the bulldozer
      * gets a crosshair. (SimTower swaps the cursor per active tool.) */
@@ -10895,16 +11125,13 @@ int main(int argc, char *argv[])
     
     /* Default window positions (matching original SimTower layout) — shifted
      * below the menu bar so nothing overlaps it. */
-    game.map_x = 0;
-    game.map_y = MENU_BAR_H;           /* Top left, under the bar */
-    game.tool_x = 0;
-    game.tool_y = MENU_BAR_H + MAP_WIN_H;  /* Below minimap */
-    game.info_x = game.screen_w - INFO_BAR_W;
-    game.info_y = MENU_BAR_H;          /* Top right, under the bar */
     game.win_dragging = 0;
     game.tool_popup = -1;
     game.demolish_mode = 0;
     game.win_toolbar = game.win_infobar = game.win_map = 1;
+    /* Map top-left, toolbox below it, info bar top-right — the original's
+     * layout; layout_windows adapts it to narrow (phone) views. */
+    layout_windows();
     game.anim_people = game.anim_effects = 1;
     game.snd_elev = game.snd_bg = game.snd_events = 1;
     /* Test affordances: --screenshot renders one input-less frame, so allow forcing
@@ -11166,9 +11393,14 @@ int main(int argc, char *argv[])
                           exe_dlg_text((uint16_t)(0xBD6 + st - 2), 1, "OK"));
     }
     (void)show_underground;
-    if (getenv("CT_ZOOM"))             /* test hook: start at a zoom step
-                                        * (index into VIEW_ZOOM_STEPS) */
-        zoom_set(atoi(getenv("CT_ZOOM")), game.screen_w / 2, game.screen_h / 2);
+    {   /* start at a zoom step (index into VIEW_ZOOM_STEPS): --zoom=N from
+         * the web shell (touch devices open at 2x), CT_ZOOM for tests */
+        int zi = getenv("CT_ZOOM") ? atoi(getenv("CT_ZOOM")) : -1;
+        for (int i = 1; i < argc; i++)
+            if (!strncmp(argv[i], "--zoom=", 7)) zi = atoi(argv[i] + 7);
+        if (zi >= 0)
+            zoom_set(zi, game.screen_w / 2, game.screen_h / 2);
+    }
     
     printf("\n=== ConciliaTower running ===\n");
     printf("Controls:\n");
@@ -11199,6 +11431,7 @@ int main(int argc, char *argv[])
 
     int frame = 0;
     while (game.running) {
+        apply_pending_requests();
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             handle_event(&ev);
@@ -11882,11 +12115,8 @@ int main(int argc, char *argv[])
                 }
                 render();
             }
-            SDL_Surface *sshot = SDL_CreateRGBSurface(0, game.screen_w, game.screen_h, 32,
-                0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
-            SDL_RenderReadPixels(game.renderer, NULL, SDL_PIXELFORMAT_ARGB8888,
-                                 sshot->pixels, sshot->pitch);
-            SDL_SaveBMP(sshot, screenshot_path);
+            SDL_Surface *sshot = read_screen_surface();
+            if (sshot) SDL_SaveBMP(sshot, screenshot_path);
             SDL_FreeSurface(sshot);
             printf("Auto-screenshot saved to %s\n", screenshot_path);
             game.running = 0;
