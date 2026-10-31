@@ -1192,6 +1192,18 @@
   window.addEventListener('orientationchange', fitSoon);
   if (window.visualViewport) window.visualViewport.addEventListener('resize', fitSoon);
   document.addEventListener('fullscreenchange', fitSoon);
+  /* Safety net: iOS can report the rotated size after its resize event,
+   * and some embedders never send one. While playing, re-fit whenever the
+   * viewport size changed since the last fit. */
+  var lastVp = '';
+  setInterval(function () {
+    if (!Module.engineStarted) return;
+    var vv = window.visualViewport;
+    var key = (vv ? vv.width + 'x' + vv.height : '') + '/' +
+              window.innerWidth + 'x' + window.innerHeight + '@' +
+              (window.devicePixelRatio || 1);
+    if (key !== lastVp) { lastVp = key; fitView(); }
+  }, 500);
 
   /* Canvas pixel under a client point, in the engine's logical pixels. */
   function canvasPoint(ev) {

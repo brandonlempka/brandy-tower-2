@@ -10570,7 +10570,9 @@ static void touch_event(const SDL_Event *ev)
     long long id = (long long)ev->tfinger.fingerId;
     switch (ev->type) {
     case SDL_FINGERDOWN:
-        touch_down(&game.touch, &TOUCH_HANDLERS, id, x, y, SDL_GetTicks());
+        /* the event's own time, not when this frame got to it: a slow
+         * frame must not turn a quick tap into a long-press */
+        touch_down(&game.touch, &TOUCH_HANDLERS, id, x, y, ev->tfinger.timestamp);
         break;
     case SDL_FINGERMOTION:
         touch_move(&game.touch, &TOUCH_HANDLERS, id, x, y);
@@ -11051,6 +11053,21 @@ EMSCRIPTEN_KEEPALIVE void ct_set_view(int w, int h)
 {
     game.pending_view_w = w;
     game.pending_view_h = h;
+}
+
+/* Test probes (tests/web/probe_touch.js): the view and build state as
+ * JSON, so gestures can be asserted without reading pixels. */
+EMSCRIPTEN_KEEPALIVE const char *ct_view_state(void)
+{
+    static char buf[256];
+    snprintf(buf, sizeof buf,
+             "{\"zoom\":%d,\"cx\":%.1f,\"cy\":%.1f,\"sw\":%d,\"sh\":%d,"
+             "\"vw\":%d,\"vh\":%d,\"money\":%ld,\"pending\":%d,"
+             "\"build\":%d,\"map\":%d}",
+             game.zoom_idx, game.cam_fx, game.cam_fy, game.screen_w,
+             game.screen_h, game.view_w, game.view_h, (long)game.tower.money,
+             game.place_pending, (int)game.build_type, game.win_map);
+    return buf;
 }
 
 /* Shell -> engine: one zoom step about a logical canvas point (trackpad
@@ -12178,11 +12195,13 @@ int main(int argc, char *argv[])
     int frame = 0;
     while (game.running) {
         apply_pending_requests();
-        touch_tick(&game.touch, &TOUCH_HANDLERS, SDL_GetTicks());
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             handle_event(&ev);
         }
+        /* after the queue is drained, so a release already waiting in it
+         * wins over the long-press timer */
+        touch_tick(&game.touch, &TOUCH_HANDLERS, SDL_GetTicks());
 
         /* Build-drag clatter (#7001, referee row 18): a looping sound that
          * rings while a build is being dragged out and stops on release.

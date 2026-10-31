@@ -25,7 +25,8 @@ class Cdp {
       ...extraArgs,
       'about:blank',
     ];
-    this.chrome = spawn('chromium', args, {
+    /* CHROME=/path/to/chrome for hosts without a `chromium` on PATH (macOS) */
+    this.chrome = spawn(process.env.CHROME || 'chromium', args, {
       stdio: ['ignore', 'ignore',
               fs.openSync(this.opts.chromeLog || '/dev/null', 'w'),
               'pipe', 'pipe'],

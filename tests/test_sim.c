@@ -1,7 +1,9 @@
 /* test_sim.c — checks for transport reachability, housekeeping, and the
  * people/elevator pipeline.
  * Build: gcc -o /tmp/test_sim tests/test_sim.c src/tower.c src/game.c \
- *            src/people.c src/twr.c src/sound_hook.c -Isrc -lm
+ *            src/people.c src/twr.c src/sound_hook.c src/touch.c \
+ *            src/hints.c -Isrc -lm
+ *        (macOS: add -include stddef.h — glibc pulls offsetof in for us) 
  * No SDL needed — pure simulation (sound_hook.c is a no-op stub here). */
 #include <stdio.h>
 #include <string.h>

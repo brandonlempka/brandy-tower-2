@@ -166,6 +166,40 @@ of that script.
 - **[`docs/REFACTOR-PLAN-runtime-model.md`](docs/REFACTOR-PLAN-runtime-model.md)** —
   the runtime-model refactor brief (completed and merged, June 2026).
 
+## Modern play
+
+Four deliberate additions over the 1994 game, ported from the sister project
+BrandyTower. They sit on top of the faithful base — at 1x on a 960x720 window
+the frame is byte-identical to the original layout — and change no mechanics.
+
+- **Zoom** — whole steps from 0.5x to 4x (`[` `]` `Z`, Ctrl/Cmd +/-,
+  Ctrl/Cmd+wheel, trackpad or touch pinch, View menu), always about the
+  cursor. The world is drawn into an offscreen target and scaled by whole
+  pixels, so the original art never softens; the Win3.1 windows stay 1x.
+  (`src/view.h`)
+- **A view that fits the screen** — the web canvas fills the browser window
+  at whole device pixels per pixel (fractional only on small 2x phones),
+  re-fits on resize, rotation and fullscreen, and the windows re-lay out:
+  the original's spots where they fit, the minimap off and the toolbox
+  tucked in on phones, the menu bar compacted. Native macOS builds render
+  crisply on Retina.
+- **Touch** — tap, drag to build, one finger pans with the hand/inspector/
+  bulldozer (two fingers always), pinch to zoom, long-press for a tooltip.
+  A tap with a build tool parks the ghost with a Build / Cancel / nudge box
+  instead of building at once; a drag builds. Gestures are a tested,
+  SDL-free state machine (`src/touch.c`); everything ends up as the mouse
+  events the game already handles.
+- **Tooltips and explainers** — hover (or long-press) the toolbox, tools,
+  stars, funds, population or map tabs for what something costs, why it's
+  locked, where it may go, and what each remaining star rating still needs.
+  The tenant info dialog gains a docked **Notes** panel: what its status
+  means and the fix, biggest lever first. Every line is read from the same
+  functions the simulation decides with (`src/hints.c`) — the star
+  checklist and the real promotion gate share one list.
+
+`tests/web/probe_touch.js` drives the gestures on an emulated phone
+(`CHROME=<path> CT_EXE=<SIMTOWER.EXE> node tests/web/probe_touch.js`).
+
 ## Status
 
 **Playable end to end.** All six planned build phases are complete

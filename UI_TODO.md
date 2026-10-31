@@ -102,6 +102,19 @@
   hardcoded wording as fallback. Verified against the real EXE: 21 tables +
   43 dialog texts load; titles/dialogs byte-checked via harness.
 
+## Modern play — BrandyTower port (2026-10-31)
+- [x] Whole-step zoom 0.5x-4x about the cursor (world pass to an offscreen
+  target; UI stays 1x; byte-identical at 1x). `src/view.h`
+- [x] Responsive HiDPI canvas: fills the browser window, integer device px
+  per px, re-fits on resize/rotate/fullscreen; `layout_windows()` for
+  phones; compact menu bar; Retina on native macOS.
+- [x] Touch: tap / drag-build / pan / pinch / long-press, placement
+  confirm box. `src/touch.c` (+ `tests/web/probe_touch.js`)
+- [x] Tooltips + explainers (tools, star ladder, tenant Notes panel).
+  `src/hints.c`; `game_promotion_needs()` shared with the real gate.
+- [ ] Real-device pass on iOS Safari and an Android phone (tested so far in
+  desktop Chrome with an emulated phone and synthetic touch events).
+
 ## Backlog / research / MODS
 - [ ] **Save-format export UI on the landing page** (Jonah 2026-08-15):
   F6 works in-browser but is undiscoverable — add a .TDT export next to the
