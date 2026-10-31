@@ -25,6 +25,7 @@
 #include "audio.h"
 #include "sound_hook.h"
 #include "strings.h"
+#include "view.h"
 
 /* ---------- Window / display ---------- */
 #define WINDOW_W    960
@@ -422,8 +423,14 @@ typedef struct {
     /* Camera smoothing */
     float           cam_fx, cam_fy;
     
-    /* Zoom */
+    /* Zoom (view.h): the world pass renders into a virtual viewport of
+     * view_w x view_h world pixels, blitted at `zoom` screen px per world
+     * px. view_w/view_h equal screen_w/screen_h at 1x. */
     float           zoom;
+    int             zoom_idx;        /* index into VIEW_ZOOM_STEPS */
+    int             view_w, view_h;  /* virtual viewport, world pixels */
+    SDL_Texture    *world_tex;       /* world-pass target when zoom != 1 */
+    int             world_tex_w, world_tex_h;
     
     /* Cloud sprites (up to 4 different shapes + Santa Easter egg) */
     Sprite         *clouds[SPR_CLOUD_COUNT];
@@ -622,6 +629,9 @@ typedef struct {
 #define ACT_EXPORT_SAV    30   /* Game menu: portable web-save download */
 #define ACT_MANUAL        31   /* Help menu: original 1994 manual (archive.org)
                                   in a new tab (Jonah 2026-09-11) */
+#define ACT_ZOOM_IN       32   /* View menu (port addition): whole-step zoom */
+#define ACT_ZOOM_OUT      33
+#define ACT_ZOOM_RESET    34
 #define ACT_MASS_PRICING  29   /* Port tool (Jonah 2026-08-12): bulk rent-
                                   class changes; no EXE counterpart */
 
@@ -696,8 +706,12 @@ static const MenuItem menu_view[] = {
     { "Screenshot\tF12",   ITEM_NONE,  ACT_SCREENSHOT },
     { NULL, ITEM_NONE, ACT_NONE },
     { "Santa!\tF2",        ITEM_NONE,  ACT_SANTA },
+    { NULL, ITEM_NONE, ACT_NONE },
+    { "Zoom In\t]",        ITEM_NONE,  ACT_ZOOM_IN },
+    { "Zoom Out\t[",       ITEM_NONE,  ACT_ZOOM_OUT },
+    { "Actual Size\tZ",    ITEM_NONE,  ACT_ZOOM_RESET },
 };
-#define MENU_VIEW_COUNT 8
+#define MENU_VIEW_COUNT 12
 
 /* Game menu — save/load, mode (radio), quit. Every keyboard command has a
  * menu home (VNC clients often can't send function keys). */
@@ -824,10 +838,21 @@ static const CloudPos CLOUD_POSITIONS[] = {
 
 /* ---------- Coordinate conversion ---------- */
 
+/* Recompute the virtual viewport after a zoom or window-size change. */
+static void update_view_size(void)
+{
+    game.zoom_idx = view_clamp_zoom_index(game.zoom_idx);
+    game.zoom = VIEW_ZOOM_STEPS[game.zoom_idx];
+    game.view_w = view_virtual_extent(game.screen_w, game.zoom);
+    game.view_h = view_virtual_extent(game.screen_h, game.zoom);
+}
+
+/* sx/sy here are VIRTUAL viewport pixels (== screen pixels at 1x). Input
+ * handlers holding real screen coordinates go through mouse_to_grid. */
 static void screen_to_grid(int sx, int sy, int *floor, int *cell)
 {
-    int world_x = sx + (int)game.cam_fx - game.screen_w / 2;
-    int world_y = sy + (int)game.cam_fy - game.screen_h / 2;
+    int world_x = sx + (int)game.cam_fx - game.view_w / 2;
+    int world_y = sy + (int)game.cam_fy - game.view_h / 2;
 
     /* True floor-division by CELL_H. Plain integer division truncates toward
      * zero, which picks the wrong floor (off by one) above ground where
@@ -847,8 +872,18 @@ static void grid_to_screen(int floor, int cell, int *sx, int *sy)
     int world_x = cell * CELL_W;
     int world_y = -floor * CELL_H;
 
-    *sx = world_x - (int)game.cam_fx + game.screen_w / 2;
-    *sy = world_y - (int)game.cam_fy + game.screen_h / 2;
+    *sx = world_x - (int)game.cam_fx + game.view_w / 2;
+    *sy = world_y - (int)game.cam_fy + game.view_h / 2;
+}
+
+/* Real screen pixel -> virtual viewport pixel. */
+static int scr_to_vx(int sx) { return view_screen_to_virtual(sx, game.zoom); }
+static int scr_to_vy(int sy) { return view_screen_to_virtual(sy, game.zoom); }
+
+/* Real screen coordinates (mouse/touch) -> grid. */
+static void mouse_to_grid(int sx, int sy, int *floor, int *cell)
+{
+    screen_to_grid(scr_to_vx(sx), scr_to_vy(sy), floor, cell);
 }
 
 /* Shared ambient occupancy gate (ambient-gates referee 2026-08-09, SoundT
@@ -906,8 +941,8 @@ static void ambient_tick(void)
 
     int sel = rand() % 6;                     /* probe: {mid,¾-down} × {¼,½,¾} */
     int frac = sel % 3;                       /* 0,1,2 -> ¼,½,¾ */
-    int sx = game.screen_w * (frac + 1) / 4;
-    int sy = (sel < 3) ? game.screen_h / 2 : game.screen_h * 3 / 4;
+    int sx = game.view_w * (frac + 1) / 4;
+    int sy = (sel < 3) ? game.view_h / 2 : game.view_h * 3 / 4;
 
     int floor, cell;
     screen_to_grid(sx, sy, &floor, &cell);
@@ -962,7 +997,7 @@ static void ambient_tick(void)
  * the deepest basement, or absurdly far above the build ceiling. */
 static void clamp_camera(void)
 {
-    float half = game.screen_h / 2.0f;
+    float half = game.view_h / 2.0f;
     /* Bottom: one row PAST B10's lower edge — pit machinery draws a row
      * below a shaft's last segment, and a legacy B10-reaching shaft
      * (possible before the B9 extend gate, 2026-08-12) needs its pit
@@ -975,12 +1010,39 @@ static void clamp_camera(void)
     if (game.cam_fy < top)    game.cam_fy = top;
 
     /* Horizontal: keep at least part of the tower's width on screen. */
-    float halfw = game.screen_w / 2.0f;
+    float halfw = game.view_w / 2.0f;
     float right = (float)(TOWER_WIDTH * CELL_W) - halfw;
     float left  = halfw;
     if (left > right) left = right;
     if (game.cam_fx > right) game.cam_fx = right;
     if (game.cam_fx < left)  game.cam_fx = left;
+}
+
+/* Set the zoom step, keeping the world point under screen (sx, sy) fixed
+ * (BrandyTower camera.ts zoomTo). Cancels any camera glide. */
+static void zoom_set(int idx, int sx, int sy)
+{
+    idx = view_clamp_zoom_index(idx);
+    if (idx == game.zoom_idx) return;
+    float nx, ny;
+    view_zoom_about(game.cam_fx, game.cam_fy, game.screen_w, game.screen_h,
+                    game.zoom, VIEW_ZOOM_STEPS[idx], sx, sy, &nx, &ny);
+    game.zoom_idx = idx;
+    update_view_size();
+    game.cam_fx = nx;
+    game.cam_fy = ny;
+    game.cam_anim = 0;
+    clamp_camera();
+}
+
+static void zoom_step(int dir, int sx, int sy)
+{
+    zoom_set(game.zoom_idx + (dir > 0 ? 1 : -1), sx, sy);
+}
+
+static void zoom_step_center(int dir)
+{
+    zoom_step(dir, game.screen_w / 2, game.screen_h / 2);
 }
 
 /* ---------- HUD text rendering helpers ---------- */
@@ -1180,8 +1242,11 @@ static void render_sky(void)
         } else {
             santa_fx += (truex - santa_fx) * 0.35f;
         }
+        /* The sim launches him at a fixed 960+100 (screen-space, the
+         * original's window); on a wider view anchor that to the right
+         * edge so he still enters from off-screen. */
         SDL_Rect dst = {
-            (int)lroundf(santa_fx),
+            (int)lroundf(santa_fx) + (game.view_w - WINDOW_W),
             lobby_sy + CELL_H - 0x84c + game.sim.santa.y,
             game.santa->w, game.santa->h
         };
@@ -4907,7 +4972,8 @@ static void render_minimap(void)
      * santa.x is screen-space, so convert to world; his altitude is the
      * fixed 0x84c px above ground minus the descent. */
     if (game.sim.santa.active) {
-        int wx_px = game.sim.santa.x + (int)game.cam_fx - game.screen_w / 2
+        int wx_px = game.sim.santa.x + (game.view_w - WINDOW_W)
+                    + (int)game.cam_fx - game.view_w / 2
                     + (game.santa ? game.santa->w / 2 : 0);
         int cell = wx_px / CELL_W;
         if (cell >= 0 && cell < TOWER_WIDTH) {
@@ -4984,8 +5050,8 @@ static void render_minimap(void)
     /* Camera viewport indicator — tracks BOTH axes of the view */
     {
         int cam_floor_top, cam_floor_bot, cam_xl, cam_xr;
-        screen_to_grid(0, HUD_HEIGHT + MENU_BAR_H, &cam_floor_top, &cam_xl);
-        screen_to_grid(game.screen_w, game.screen_h, &cam_floor_bot, &cam_xr);
+        mouse_to_grid(0, HUD_HEIGHT + MENU_BAR_H, &cam_floor_top, &cam_xl);
+        mouse_to_grid(game.screen_w, game.screen_h, &cam_floor_bot, &cam_xr);
 
         int vt = (int)(ground_line - (cam_floor_top + 1) * pf);
         int vb = (int)(ground_line - cam_floor_bot * pf);
@@ -7227,12 +7293,15 @@ static void draw_tenant_picture(const Tenant *t, SDL_Rect box)
     if (tgt) {
         SDL_SetRenderTarget(game.renderer, tgt);
         float sx = game.cam_fx, sy = game.cam_fy;
+        int svw = game.view_w, svh = game.view_h;   /* picture is 1x */
+        game.view_w = game.screen_w; game.view_h = game.screen_h;
         game.cam_fx = (float)(wx0 + game.screen_w / 2);
         game.cam_fy = (float)(wy0 + game.screen_h / 2);
         render_sky();
         render_tower();
         render_people();
         game.cam_fx = sx; game.cam_fy = sy;
+        game.view_w = svw; game.view_h = svh;
         SDL_SetRenderTarget(game.renderer, NULL);
     }
 
@@ -8261,6 +8330,38 @@ static void render(void)
     SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
     SDL_RenderClear(game.renderer);
 
+    /* World pass. At 1x it draws straight to the screen (the faithful
+     * path, untouched). Zoomed, it draws into a view_w x view_h target
+     * with screen_w/h temporarily set to the virtual size — every world
+     * renderer sizes itself off them — and is then blitted whole-pixel
+     * (nearest) onto the screen. UI windows below always draw at 1x. */
+    int zoomed = game.zoom_idx != VIEW_ZOOM_DEFAULT;
+    int real_w = game.screen_w, real_h = game.screen_h;
+    if (zoomed) {
+        if (!game.world_tex || game.world_tex_w != game.view_w ||
+            game.world_tex_h != game.view_h) {
+            if (game.world_tex) SDL_DestroyTexture(game.world_tex);
+            game.world_tex = SDL_CreateTexture(game.renderer,
+                SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET,
+                game.view_w, game.view_h);
+            game.world_tex_w = game.view_w;
+            game.world_tex_h = game.view_h;
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+            if (game.world_tex)
+                SDL_SetTextureScaleMode(game.world_tex, SDL_ScaleModeNearest);
+#endif
+        }
+        if (game.world_tex) {
+            SDL_SetRenderTarget(game.renderer, game.world_tex);
+            SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
+            SDL_RenderClear(game.renderer);
+            game.screen_w = game.view_w;
+            game.screen_h = game.view_h;
+        } else {
+            zoomed = 0;   /* no target support: fall back to 1x drawing */
+        }
+    }
+
     render_sky();
     if (game.elv_edit_mode) {
         render_elv_edit_mode();   /* silhouette tower + isolated shaft */
@@ -8289,6 +8390,14 @@ static void render(void)
         render_fire_glow();    /* warm tint washed over the world while it burns */
         render_crane();
         render_build_ghost();
+    }
+    if (zoomed) {
+        game.screen_w = real_w;
+        game.screen_h = real_h;
+        SDL_SetRenderTarget(game.renderer, NULL);
+        SDL_Rect dst = { 0, 0, (int)(game.view_w * game.zoom),
+                         (int)(game.view_h * game.zoom) };
+        SDL_RenderCopy(game.renderer, game.world_tex, NULL, &dst);
     }
     render_ui();
     render_stats_window();
@@ -8955,8 +9064,12 @@ static void execute_menu_item(const MenuItem *item)
     case ACT_STATS:  game.show_stats  = !game.show_stats;  break;
     case ACT_TUNING: game.show_tuning = !game.show_tuning; break;
     case ACT_SANTA:
-        if (!game.sim.santa.active) game_launch_santa(&game.sim, game.screen_w);
+        if (!game.sim.santa.active) game_launch_santa(&game.sim, WINDOW_W);
         break;
+    case ACT_ZOOM_IN:    zoom_step_center(+1); break;
+    case ACT_ZOOM_OUT:   zoom_step_center(-1); break;
+    case ACT_ZOOM_RESET: zoom_set(VIEW_ZOOM_DEFAULT, game.screen_w / 2,
+                                  game.screen_h / 2); break;
     case ACT_WIN_TOOLBAR:  game.win_toolbar ^= 1; break;
     case ACT_WIN_INFOBAR:  game.win_infobar ^= 1; break;
     case ACT_WIN_MAP:      game.win_map ^= 1;     break;
@@ -9252,8 +9365,18 @@ static void handle_event(SDL_Event *ev)
                 game.sim.speed = SPEED_PAUSED;
             printf("Speed: %s\n", game.sim.speed == SPEED_PAUSED ? "PAUSED" : "NORMAL");
             break;
+        case SDLK_RIGHTBRACKET: zoom_step(+1, game.mouse_x, game.mouse_y); break;
+        case SDLK_LEFTBRACKET:  zoom_step(-1, game.mouse_x, game.mouse_y); break;
+        case SDLK_z:
+            zoom_set(VIEW_ZOOM_DEFAULT, game.mouse_x, game.mouse_y);
+            break;
         case SDLK_EQUALS:
         case SDLK_PLUS:
+            /* Ctrl/Cmd +: browser-style zoom in (port addition) */
+            if (SDL_GetModState() & (KMOD_CTRL | KMOD_GUI)) {
+                zoom_step_center(+1);
+                break;
+            }
             /* UI cap is FAST (era-hardware approximation); TURBO is
              * mod/debug territory. */
             if (game.sim.speed < SPEED_FAST) {
@@ -9262,6 +9385,10 @@ static void handle_event(SDL_Event *ev)
             }
             break;
         case SDLK_MINUS:
+            if (SDL_GetModState() & (KMOD_CTRL | KMOD_GUI)) {
+                zoom_step_center(-1);
+                break;
+            }
             if (game.sim.speed > SPEED_PAUSED) {
                 game.sim.speed--;
                 printf("Speed: %d\n", game.sim.speed);
@@ -9271,7 +9398,7 @@ static void handle_event(SDL_Event *ev)
         /* Santa! */
         case SDLK_F2:
             if (!game.sim.santa.active) {
-                game_launch_santa(&game.sim, game.screen_w);
+                game_launch_santa(&game.sim, WINDOW_W);
             }
             break;
 
@@ -9340,15 +9467,15 @@ static void handle_event(SDL_Event *ev)
         /* Camera movement */
         /* Arrow keys = the original's scrollbar line steps (16px both
          * axes); PgUp/PgDn = its page steps (view minus one line). */
-        case SDLK_LEFT:  game.cam_fx -= 16; game.cam_anim = 0; break;
-        case SDLK_RIGHT: game.cam_fx += 16; game.cam_anim = 0; break;
-        case SDLK_UP:    game.cam_fy -= 16; game.cam_anim = 0; break;
-        case SDLK_DOWN:  game.cam_fy += 16; game.cam_anim = 0; break;
+        case SDLK_LEFT:  game.cam_fx -= 16 / game.zoom; game.cam_anim = 0; break;
+        case SDLK_RIGHT: game.cam_fx += 16 / game.zoom; game.cam_anim = 0; break;
+        case SDLK_UP:    game.cam_fy -= 16 / game.zoom; game.cam_anim = 0; break;
+        case SDLK_DOWN:  game.cam_fy += 16 / game.zoom; game.cam_anim = 0; break;
         case SDLK_PAGEUP:
-            game.cam_fy -= game.screen_h - MENU_BAR_H - 16;
+            game.cam_fy -= (game.screen_h - MENU_BAR_H - 16) / game.zoom;
             game.cam_anim = 0; break;
         case SDLK_PAGEDOWN:
-            game.cam_fy += game.screen_h - MENU_BAR_H - 16;
+            game.cam_fy += (game.screen_h - MENU_BAR_H - 16) / game.zoom;
             game.cam_anim = 0; break;
         
         /* Direct build type selection */
@@ -9401,16 +9528,16 @@ static void handle_event(SDL_Event *ev)
     case SDL_MOUSEMOTION:
         game.mouse_x = ev->motion.x;
         game.mouse_y = ev->motion.y;
-        screen_to_grid(game.mouse_x, game.mouse_y,
-                       &game.mouse_floor, &game.mouse_cell);
+        mouse_to_grid(game.mouse_x, game.mouse_y,
+                      &game.mouse_floor, &game.mouse_cell);
         cap_drag_track();   /* live shaft extension follows the cursor */
 
         /* Camera panning (middle/right-click drag) */
         if (game.cam_panning) {
             int dx = ev->motion.x - game.cam_pan_last_x;
             int dy = ev->motion.y - game.cam_pan_last_y;
-            game.cam_fx -= dx;
-            game.cam_fy -= dy;
+            game.cam_fx -= dx / game.zoom;
+            game.cam_fy -= dy / game.zoom;
             game.cam_anim = 0;
             game.cam_pan_last_x = ev->motion.x;
             game.cam_pan_last_y = ev->motion.y;
@@ -9658,7 +9785,8 @@ static void handle_event(SDL_Event *ev)
                     }
                 }
                 {
-                    uint16_t pid = person_hit_test(ev->button.x, ev->button.y);
+                    uint16_t pid = person_hit_test(scr_to_vx(ev->button.x),
+                                                   scr_to_vy(ev->button.y));
                     if (pid) {
                         open_person_popup_at(pid, ev->button.x, ev->button.y);
                         break;
@@ -9838,13 +9966,23 @@ static void handle_event(SDL_Event *ev)
             /* upper clamp happens in the renderer against the live shaft */
             break;
         }
+        /* Ctrl/Cmd+wheel = zoom about the cursor (port addition; the web
+         * shell turns trackpad pinches into ct_zoom_step calls itself). */
+        if (SDL_GetModState() & (KMOD_CTRL | KMOD_GUI)) {
+            if (ev->wheel.y) {
+                int mx, my;
+                SDL_GetMouseState(&mx, &my);
+                zoom_step(ev->wheel.y > 0 ? +1 : -1, mx, my);
+            }
+            break;
+        }
         /* Shift+wheel or horizontal wheel = scroll left/right */
         int shift = (SDL_GetModState() & KMOD_SHIFT);
         if (shift || ev->wheel.x != 0) {
             int dx = ev->wheel.x ? ev->wheel.x : ev->wheel.y;
-            game.cam_fx += dx * 60;
+            game.cam_fx += dx * 60 / game.zoom;
         } else {
-            game.cam_fy -= ev->wheel.y * 60;
+            game.cam_fy -= ev->wheel.y * 60 / game.zoom;
         }
         game.cam_anim = 0;
         break;
@@ -9857,6 +9995,7 @@ static void handle_event(SDL_Event *ev)
         if (ev->window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
             game.screen_w = ev->window.data1;
             game.screen_h = ev->window.data2;
+            update_view_size();
         }
 #endif
         break;
@@ -9877,6 +10016,8 @@ static void init_fonts(void)
     const char *font_paths[] = {
         "/fonts/LiberationSans-Bold.ttf",
         "/fonts/LiberationSans-Regular.ttf",
+        "web/fonts/LiberationSans-Bold.ttf",   /* native, run from the repo
+                                                * (macOS ships no Liberation) */
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -9888,6 +10029,7 @@ static void init_fonts(void)
      * byte-exact DTMP label rects allow ("Length" clipped, 2026-08-23). */
     const char *dlg_paths[] = {
         "/fonts/LiberationSans-Regular.ttf",
+        "web/fonts/LiberationSans-Regular.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         NULL
@@ -10083,6 +10225,8 @@ int main(int argc, char *argv[])
     
     game.screen_w = WINDOW_W;
     game.screen_h = WINDOW_H;
+    game.zoom_idx = VIEW_ZOOM_DEFAULT;
+    update_view_size();
     Uint32 wflags = SDL_WINDOW_SHOWN;
 #ifndef __EMSCRIPTEN__
     /* Fixed canvas on the web: under Emscripten RESIZABLE binds the
@@ -11022,7 +11166,9 @@ int main(int argc, char *argv[])
                           exe_dlg_text((uint16_t)(0xBD6 + st - 2), 1, "OK"));
     }
     (void)show_underground;
-    game.zoom = 1.0f;
+    if (getenv("CT_ZOOM"))             /* test hook: start at a zoom step
+                                        * (index into VIEW_ZOOM_STEPS) */
+        zoom_set(atoi(getenv("CT_ZOOM")), game.screen_w / 2, game.screen_h / 2);
     
     printf("\n=== ConciliaTower running ===\n");
     printf("Controls:\n");

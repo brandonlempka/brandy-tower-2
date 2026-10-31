@@ -7,6 +7,7 @@
 #include <string.h>
 #include "game.h"
 #include "twr.h"
+#include "view.h"
 
 static Tower tw;
 static GameSim sim;
@@ -3727,8 +3728,39 @@ static void test_load_renormalize(void)
     remove("/tmp/ct_test_v14.sav");
 }
 
+/* view.h: zoom steps stay whole-pixel and zooming about a point keeps
+ * the world point under it (BrandyTower camera.ts zoomTo, ported). */
+static void test_view_zoom(void)
+{
+    printf("view zoom:\n");
+    CHECK(VIEW_ZOOM_STEPS[VIEW_ZOOM_DEFAULT] == 1.0f, "default step is 1x");
+    CHECK(view_clamp_zoom_index(-3) == 0 &&
+          view_clamp_zoom_index(99) == VIEW_ZOOM_COUNT - 1, "index clamps");
+    CHECK(view_virtual_extent(960, 0.5f) == 1920, "0.5x doubles the view");
+    CHECK(view_virtual_extent(961, 2.0f) == 481, "2x rounds the view up");
+    CHECK(view_virtual_extent(1000, 3.0f) == 334, "3x covers the last px");
+    CHECK(view_screen_to_virtual(5, 2.0f) == 2 &&
+          view_screen_to_virtual(-1, 2.0f) == -1, "screen->virtual floors");
+
+    int ok = 1;
+    for (int a = 0; a < VIEW_ZOOM_COUNT; a++)
+        for (int b = 0; b < VIEW_ZOOM_COUNT; b++) {
+            float za = VIEW_ZOOM_STEPS[a], zb = VIEW_ZOOM_STEPS[b];
+            int sw = 960, sh = 720, sx = 300, sy = 500;
+            float cx = 1500.0f, cy = -200.0f, nx, ny;
+            view_zoom_about(cx, cy, sw, sh, za, zb, sx, sy, &nx, &ny);
+            float wa = sx / za + cx - view_virtual_extent(sw, za) / 2;
+            float wb = sx / zb + nx - view_virtual_extent(sw, zb) / 2;
+            float ha = sy / za + cy - view_virtual_extent(sh, za) / 2;
+            float hb = sy / zb + ny - view_virtual_extent(sh, zb) / 2;
+            if (fabsf(wa - wb) > 0.01f || fabsf(ha - hb) > 0.01f) ok = 0;
+        }
+    CHECK(ok, "zoom about a point keeps it fixed, every step pair");
+}
+
 int main(void)
 {
+    test_view_zoom();
     test_stairs();
     test_flavor();
     test_floor_fill();
