@@ -3701,7 +3701,7 @@ static void test_load_renormalize(void)
      * (the new scheme already incremented at the ft-2300 midnight) */
     fresh();
     tw.day = 7;
-    sim.speed = SPEED_TURBO;
+    sim.speed = SPEED_3X;               /* the old TURBO value (3) */
     sim.ticks_per_quarter = 120;         /* the old SPEED_TURBO */
     /* 2AM = 21h past 5AM: tick-in-day = 21/24 * 480 = 420 */
     sim.quarter = 3; sim.tick = 60;
@@ -3716,7 +3716,7 @@ static void test_load_renormalize(void)
           "resumed clock within one displayed minute of 2AM");
     /* midnight bump (7 -> 8) then the v17 0-based shift (8 -> 7) */
     CHECK(tw.day == 7, "post-midnight resume bumps the day (settlement cadence)");
-    CHECK(sim.speed <= SPEED_FAST, "TURBO stays clamped to FAST");
+    CHECK(sim.speed == SPEED_3X, "old TURBO save resumes at 3x");
 
     /* A v15 save (current format) must NOT be renormalized */
     fresh();

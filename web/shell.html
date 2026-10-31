@@ -1337,6 +1337,22 @@
   });
   document.addEventListener('visibilitychange', applyAudioGate);
 
+  /* Save when the tab goes to the background or is closed. 'hidden' is
+   * the last moment a browser reliably gives us (mobile Safari never
+   * fires unload, and IDB writes started in pagehide may not land), so
+   * it's the main trigger; pagehide is a best-effort backstop. The
+   * engine skips the write if nothing changed since the last save, and
+   * otherwise also autosaves every two minutes of real time. */
+  function saveOnLeave() {
+    if (document.getElementById('canvaswrap').style.display !== 'block') return;
+    try { Module.ccall('ct_autosave', null, [], []); }
+    catch (e) { console.warn('autosave on leave failed', e); }
+  }
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) saveOnLeave();
+  });
+  window.addEventListener('pagehide', saveOnLeave);
+
   document.getElementById('fsbtn').addEventListener('click', function () {
     var wrap = document.getElementById('canvaswrap');
     if (document.fullscreenElement) document.exitFullscreen();

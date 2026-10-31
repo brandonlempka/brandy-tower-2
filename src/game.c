@@ -4462,10 +4462,10 @@ int game_load(GameSim *sim, Tower *tower, const char *path)
         }
     }
     fclose(f);
-    /* Turbo lost its UI entry (speed capped at FAST, 2026-07-29) —
-     * clamp saves made before the cap. */
-    if (ok && sim->speed > SPEED_FAST)
-        sim->speed = SPEED_FAST;
+    /* Anything past the top of the speed ladder (a corrupt or future
+     * save) comes back as Fast Mode. Legacy 2/3 now read as 2x/3x. */
+    if (ok && sim->speed > SPEED_FAST_MODE)
+        sim->speed = SPEED_FAST_MODE;
     /* Clock renormalization (v15, 2026-08-02): pre-re-pace saves carry a
      * uniform 720/360/120-ticks-per-quarter clock anchored at 5:00AM.
      * Decode the OLD clock time, then re-encode it on the authentic

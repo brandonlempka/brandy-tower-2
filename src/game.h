@@ -89,14 +89,17 @@ enum {
 /* Game speed. The original's model (menu resource + TimeT 1200:01a5,
  * 2026-07-29): pause, or a 6ms-per-tick throttle, or Options -> Fast
  * Mode = unthrottled ("as fast as the machine can", 1994 hardware).
- * The day is ALWAYS 2600 ticks; speed multiplies sim steps per
- * rendered frame (main.c): NORMAL 1x, FAST 2x (the UI cap). TURBO is
- * kept for old saves/debug only — no menu entry. */
+ * The port's ladder (brought over from brandytower, 2026-10-31) puts
+ * 1x/2x/3x between pause and Fast Mode. The day is ALWAYS 2600 ticks;
+ * speed sets the WALL-CLOCK tick rate (main.c, SPEED_TICK_MS): 1x is
+ * 15 ticks/s (the 1994 experience), 2x and 3x multiply that, and Fast
+ * Mode runs ~1000 ticks/s, bounded by a per-frame time budget. */
 typedef enum {
-    SPEED_PAUSED = 0,
-    SPEED_NORMAL = 1,
-    SPEED_FAST   = 2,
-    SPEED_TURBO  = 3,
+    SPEED_PAUSED    = 0,
+    SPEED_NORMAL    = 1,   /* 1x */
+    SPEED_2X        = 2,
+    SPEED_3X        = 3,
+    SPEED_FAST_MODE = 4,   /* uncapped */
 } GameSpeed;
 
 /* Tenant occupancy state — lifecycle of a placed unit */
