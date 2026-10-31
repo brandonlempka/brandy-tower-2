@@ -578,6 +578,7 @@ const char *tower_reject_reason(void);
 /* One group per contiguous same-type vertical shaft run (matches the
  * people-sim collector's grouping). */
 int tower_shaft_group_count(const Tower *tower);
+int tower_pool_full(const Tower *tower, ItemType type);
 
 /* Floor-deck economics (MoneyT TerrainCost 1178:0583): a floor's deck is
  * one contiguous span; building charges cells outside the current span

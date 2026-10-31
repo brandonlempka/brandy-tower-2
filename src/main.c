@@ -27,6 +27,7 @@
 #include "strings.h"
 #include "view.h"
 #include "touch.h"
+#include "hints.h"
 
 /* ---------- Window / display ---------- */
 #define WINDOW_W    960
@@ -518,7 +519,15 @@ typedef struct {
      * placement confirm; a drag builds straight away. */
     TouchState      touch;
     int             place_pending, place_floor, place_cell;
+    int             place_box_x, place_box_y;   /* box stays put while
+                                                 * nudging (-1 = re-place) */
+    int             last_input_touch;           /* hover tooltips are for
+                                                 * mice; touch long-presses */
     int             touch_drag_btn;  /* synthesized left button is down */
+    /* Tooltips (hints.c): shown after the mouse rests TIP_DELAY_MS on a
+     * target, or pinned by a touch long-press / a press on the stars. */
+    unsigned        tip_moved_ms;
+    int             tip_pinned, tip_x, tip_y;
     int             win_drag_ox;     /* Mouse offset from window origin at drag start */
     int             win_drag_oy;
     
@@ -1113,6 +1122,10 @@ static void update_px_scale(void);            /* responsive layout, below */
 static void touch_event(const SDL_Event *ev); /* touch input, below */
 static void clamp_win(int *x, int *y, int w, int h);
 static void render_place_confirm(void);
+static void render_tooltip(void);
+static void render_tenant_notes(void);
+static void tooltip_input(const SDL_Event *ev);
+static int  notes_panel_rect(SDL_Rect *r);
 static void apply_view_size(int w, int h);
 
 /* Read the presented frame into a new surface sized to the renderer's
@@ -8181,6 +8194,10 @@ static int movie_chooser_click(int mx, int my)
 static int inspect_popup_click(int mx, int my)
 {
     if (!game.inspect_open) return 0;
+    {   /* the docked Notes panel is part of the dialog */
+        SDL_Rect nr;
+        if (notes_panel_rect(&nr) && point_in_rect(mx, my, nr)) return 1;
+    }
     Tenant *t = tower_tenant(&game.tower, game.inspect_tid);
     if (!t) { game.inspect_open = 0; return 0; }
     TiLayout L; ti_build(t, &L);
@@ -8495,6 +8512,7 @@ static void render(void)
     render_elv_dialog();
     render_fin_dialog();
     render_inspect_popup();
+    render_tenant_notes();    /* "why / how to fix" docked under it */
     render_person_popup();
     render_movie_chooser();   /* sub-dialogs draw on top of the info popup */
     render_name_editor();
@@ -8507,6 +8525,7 @@ static void render(void)
     render_notice_modal();     /* resolution/VIP notices, same layer */
     render_route_confirm();    /* likewise */
     render_quit_confirm();     /* topmost — quitting outranks all */
+    render_tooltip();          /* hints sit over everything they explain */
 
     SDL_RenderPresent(game.renderer);
 }
@@ -9091,7 +9110,14 @@ static void execute_menu_item(const MenuItem *item)
 {
     if (item->build_type != ITEM_NONE) {
         if (!item_unlocked(item->build_type)) {   /* locked in Campaign */
-            add_event_message("Locked — raise your star rating first.");
+            /* say WHICH rating unlocks it (hints.c), not just "locked" */
+            const char *why = hints_unavailable(&game.sim, &game.tower,
+                                                item->build_type);
+            char msg[EVENT_MSG_LEN];
+            snprintf(msg, sizeof msg, "%s: %s",
+                     tower_item_name(item->build_type),
+                     why ? why : "raise your star rating first");
+            add_event_message(msg);
             game.menu_open = -1;
             return;
         }
@@ -9301,6 +9327,8 @@ static void cap_drag_track(void)
 /* ---------- Input handling ---------- */
 static void handle_event(SDL_Event *ev)
 {
+    tooltip_input(ev);       /* hide/pin tooltips; never consumes the event */
+
     /* Quit save-prompt: fully modal, topmost. */
     if (game.quit_confirm) {
         switch (ev->type) {
@@ -10302,6 +10330,11 @@ static int cap_at(int floor, int cell)
 
 static void place_confirm_origin(int *ox, int *oy)
 {
+    if (game.place_box_x >= 0) {      /* anchored where it first opened */
+        *ox = game.place_box_x;
+        *oy = game.place_box_y;
+        return;
+    }
     int gx, gy;
     grid_to_screen(game.place_floor, game.place_cell, &gx, &gy);
     gx = (int)(gx * game.zoom);
@@ -10311,6 +10344,24 @@ static void place_confirm_origin(int *ox, int *oy)
     if (y + PC_H > game.screen_h) y = gy - (int)(CELL_H * game.zoom) - PC_H - 8;
     clamp_win(&x, &y, PC_W, PC_H);
     *ox = x; *oy = y;
+}
+
+/* Re-anchor the box if a nudge pushed the ghost underneath it. */
+static void place_confirm_reanchor(void)
+{
+    int gx, gy;
+    grid_to_screen(game.place_floor, game.place_cell, &gx, &gy);
+    SDL_Rect ghost = { (int)((gx - 4 * CELL_W) * game.zoom),
+                       (int)((gy - CELL_H) * game.zoom),
+                       (int)(9 * CELL_W * game.zoom), (int)(3 * CELL_H * game.zoom) };
+    SDL_Rect box = { game.place_box_x, game.place_box_y, PC_W, PC_H };
+    if (game.place_box_x < 0 || SDL_HasIntersection(&ghost, &box)) {
+        game.place_box_x = -1;
+        int x, y;
+        place_confirm_origin(&x, &y);
+        game.place_box_x = x;
+        game.place_box_y = y;
+    }
 }
 
 /* Button rects: 0..3 = left/up/down/right nudges, 4 = Build, 5 = Cancel */
@@ -10366,6 +10417,8 @@ static void place_confirm_at(int x, int y)
     game.place_pending = 1;
     game.place_floor = f;
     game.place_cell = c;
+    game.place_box_x = -1;           /* open next to the new spot */
+    place_confirm_reanchor();
 }
 
 /* Returns 1 if the tap landed on the confirm box. */
@@ -10387,15 +10440,22 @@ static int place_confirm_tap(int x, int y)
             grid_to_screen(game.place_floor, game.place_cell, &gx, &gy);
             gx = (int)((gx + CELL_W / 2) * game.zoom);
             gy = (int)((gy + CELL_H / 2) * game.zoom);
+            long money0 = game.tower.money;
+            int count0 = game.tower.tenant_count;
             game.place_pending = 0;
             synth_button(1, gx, gy);   /* no motion: keep the parked cell */
             synth_button(0, gx, gy);
+            /* refused (the message line says why): keep the ghost parked
+             * so it can be nudged and tried again */
+            if (game.tower.money == money0 && game.tower.tenant_count == count0)
+                game.place_pending = 1;
             break;
         }
         default: game.place_pending = 0; break;
         }
         if (game.place_cell < 0) game.place_cell = 0;
         if (game.place_cell >= TOWER_WIDTH) game.place_cell = TOWER_WIDTH - 1;
+        if (game.place_pending && i < 4) place_confirm_reanchor();
         return 1;
     }
     {   /* the box's body swallows near-misses */
@@ -10521,8 +10581,356 @@ static void touch_event(const SDL_Event *ev)
     }
 }
 
-/* Long-press: until the tooltip layer lands, just move the cursor there. */
-static void tooltip_long_press(int x, int y) { synth_motion(x, y); }
+/* ---------- Tooltips and explainers (port addition; text in hints.c) ----
+ * BrandyTower's title-attribute tooltips and inspector notes, drawn in the
+ * port's Win3.1 chrome. A mouse gets them after resting TIP_DELAY_MS on a
+ * target; a touchscreen has no hover, so a long-press pins one (and on the
+ * tower itself shows that unit's notes). */
+#define TIP_DELAY_MS 500
+#define TIP_MAX_W    300
+
+static void tooltip_long_press(int x, int y)
+{
+    game.tip_pinned = 1;
+    game.tip_x = x;
+    game.tip_y = y;
+}
+
+static int info_stars_rect(SDL_Rect *r)
+{
+    if (!game.win_infobar) return 0;
+    *r = (SDL_Rect){ game.info_x + 42, game.info_y + WIN_TITLEBAR_H + 2,
+                     5 * 21, 19 };
+    return 1;
+}
+
+static void tooltip_input(const SDL_Event *ev)
+{
+    int real_mouse =
+        (ev->type == SDL_MOUSEMOTION && ev->motion.which != SDL_TOUCH_MOUSEID) ||
+        (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.which != SDL_TOUCH_MOUSEID) ||
+        ev->type == SDL_MOUSEWHEEL;
+    /* a touchscreen finger (a Mac trackpad's fingers are not pointers) */
+    int finger = ev->type == SDL_FINGERDOWN
+#if SDL_VERSION_ATLEAST(2, 0, 10)
+        && SDL_GetTouchDeviceType(ev->tfinger.touchId) == SDL_TOUCH_DEVICE_DIRECT
+#endif
+        ;
+    if (real_mouse || ev->type == SDL_KEYDOWN || finger) {
+        game.tip_moved_ms = SDL_GetTicks();
+        game.tip_pinned = 0;
+    }
+    if (finger) game.last_input_touch = 1;
+    else if (real_mouse) game.last_input_touch = 0;
+    /* A press on the stars (mouse or tap) pins the rating checklist —
+     * BrandyTower's "press the rating for what's next". */
+    if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_LEFT) {
+        SDL_Rect sr;
+        if (info_stars_rect(&sr) && point_in_rect(ev->button.x, ev->button.y, sr))
+            tooltip_long_press(ev->button.x, ev->button.y);
+    }
+}
+
+/* The item a toolbox group button stands for right now. */
+static ItemType tool_button_item(int i)
+{
+    const ToolButton *tb = &tool_buttons[i];
+    for (int j = 0; j < tb->sub_count; j++)
+        if (tb->sub[j] == (ItemType)game.build_type) return tb->sub[j];
+    if (item_unlocked(tb->type)) return tb->type;
+    for (int j = 0; j < tb->sub_count; j++)
+        if (item_unlocked(tb->sub[j])) return tb->sub[j];
+    return tb->type;
+}
+
+#define TIP_PUSH(...) do { if (n < max) { \
+    snprintf(lines[n], HINT_LEN, __VA_ARGS__); n++; } } while (0)
+
+/* What the tooltip at screen (x, y) says. `world` also explains the unit
+ * under the point (long-press only — hovering the tower stays quiet). */
+static int tooltip_content(int x, int y, int world,
+                           char lines[][HINT_LEN], int max)
+{
+    int n = 0;
+    /* Build menus: the hovered item, with why it's greyed. */
+    if (game.menu_open >= 0 && game.menu_hover >= 0) {
+        const TopMenu *tm = &top_menus[game.menu_open];
+        if (game.menu_hover < tm->count) {
+            const MenuItem *it = &tm->items[game.menu_hover];
+            if (it->label && it->build_type != ITEM_NONE)
+                return hints_tool(&game.sim, &game.tower, it->build_type,
+                                  lines, max);
+        }
+        return 0;
+    }
+    if (game.win_toolbar) {
+        int wy = game.tool_y + WIN_TITLEBAR_H, speed_y = wy + 8;
+        int tools_y = speed_y + 28;
+        /* pull-down sub-items */
+        if (game.tool_popup >= 0 && game.tool_popup < TOOL_BTN_COUNT) {
+            int nvis = tool_sub_visible_count(game.tool_popup);
+            for (int vj = 0; vj < nvis; vj++) {
+                int j = tool_sub_visible_index(game.tool_popup, vj), bx, by;
+                if (j < 0) continue;
+                tool_sub_rect(game.tool_popup, vj, &bx, &by);
+                SDL_Rect r = { bx, by, TOOL_BTN_SIZE, TOOL_BTN_SIZE };
+                if (point_in_rect(x, y, r))
+                    return hints_tool(&game.sim, &game.tower,
+                                      tool_buttons[game.tool_popup].sub[j],
+                                      lines, max);
+            }
+        }
+        for (int i = 0; i < TOOL_BTN_COUNT; i++) {
+            int bx, by;
+            tool_button_rect(i, &bx, &by);
+            SDL_Rect r = { bx, by, TOOL_BTN_SIZE, TOOL_BTN_SIZE };
+            if (!point_in_rect(x, y, r)) continue;
+            n = hints_tool(&game.sim, &game.tower, tool_button_item(i),
+                           lines, max);
+            if (tool_buttons[i].sub_count > 1)
+                TIP_PUSH("Hold for the other kinds in this group");
+            return n;
+        }
+        SDL_Rect play = { game.tool_x + (TOOL_WIN_W - SPEED_BTN_W) / 2, speed_y,
+                          SPEED_BTN_W, SPEED_BTN_H };
+        if (point_in_rect(x, y, play)) {
+            TIP_PUSH("%s (Space)", game.sim.speed > 0 ? "Pause" : "Play");
+            TIP_PUSH("Normal and Fast Mode are in the Speed menu");
+            return n;
+        }
+        int tx = game.tool_x + (TOOL_WIN_W - 3 * 21) / 2;
+        static const char *tools[3][2] = {
+            { "Bulldozer", "Demolish a unit, stairs or a shaft" },
+            { "Hand", "Open an elevator's controls, or drag a shaft's top or "
+                      "bottom to resize it. On a touchscreen, drag to scroll" },
+            { "Inspector", "Show a unit's tenants, opinion and notes" },
+        };
+        for (int t = 0; t < 3; t++) {
+            SDL_Rect r = { tx + t * 21, tools_y, 21, 21 };
+            if (point_in_rect(x, y, r)) {
+                TIP_PUSH("%s", tools[t][0]);
+                TIP_PUSH("%s", tools[t][1]);
+                return n;
+            }
+        }
+    }
+    if (game.win_infobar) {
+        SDL_Rect sr;
+        if (info_stars_rect(&sr) && point_in_rect(x, y, sr))
+            return hints_rating(&game.sim, &game.tower, lines, max);
+        int wy = game.info_y + WIN_TITLEBAR_H;
+        SDL_Rect fund = { game.info_x + INFO_BAR_W - 120, wy, 120, INFO_BAR_H / 2 };
+        SDL_Rect pop  = { game.info_x + INFO_BAR_W - 120, wy + INFO_BAR_H / 2,
+                          120, INFO_BAR_H / 2 };
+        if (point_in_rect(x, y, fund)) {
+            TIP_PUSH("Funds");
+            TIP_PUSH("Rent is collected each quarter; shops and restaurants "
+                     "pay by the day. Report: View > Financial Statement (F7)");
+            return n;
+        }
+        if (point_in_rect(x, y, pop)) {
+            TIP_PUSH("Population");
+            TIP_PUSH("Star ratings judge the standing population: workers "
+                     "count while employed, not only while in the building");
+            if (game.tower.star_rating < 6) {
+                char want[HINT_LEN];
+                hints_next_rating(&game.sim, &game.tower, want, sizeof want);
+                TIP_PUSH("%s", want);
+            }
+            return n;
+        }
+    }
+    if (game.win_map) {
+        int map_x = game.map_x + 4, map_w = MAP_WIN_W - 8;
+        int map_y = game.map_y + WIN_TITLEBAR_H + 4;
+        int map_h = MAP_WIN_H - WIN_TITLEBAR_H - 26;
+        SDL_Rect tabs = { map_x, map_y + map_h + 2, map_w, MAP_TAB_H };
+        if (point_in_rect(x, y, tabs)) {
+            static const char *tab[4][2] = {
+                { "Edit", "The tower as built. Press the map to go there" },
+                { "Eval", "Each unit in its tenants' opinion: cyan good, "
+                          "yellow fair, red bad (they will leave)" },
+                { "Pricing", "Each unit colored by its rent tier" },
+                { "Hotel", "Hotel rooms by state: free, sold, dirty, roaches. "
+                           "Opens at 2 stars" },
+            };
+            int m = (x - map_x) / (map_w / 4);
+            if (m > 3) m = 3;
+            TIP_PUSH("%s", tab[m][0]);
+            TIP_PUSH("%s", tab[m][1]);
+            return n;
+        }
+    }
+    if (world && !ui_owns_point(x, y)) {
+        int f, c;
+        mouse_to_grid(x, y, &f, &c);
+        int fidx = floor_to_index(f);
+        if (fidx < 0 || fidx >= TOWER_FLOOR_COUNT || c < 0 || c >= TOWER_WIDTH)
+            return 0;
+        Tenant *t = tower_tenant(&game.tower, game.tower.grid[fidx][c].tenant_id);
+        if (!t) return 0;
+        if (t->name[0]) TIP_PUSH("%s (%s)", t->name, tower_item_name(t->type));
+        else TIP_PUSH("%s", tower_item_name(t->type));
+        n += hints_tenant_notes(&game.sim, &game.tower, t, lines + n, max - n);
+        if (n == 1) TIP_PUSH("Nothing needs attention here");
+        return n;
+    }
+    return n;
+}
+
+/* Greedy word-wrap of `in` into `out` at max_w px in `font`. */
+static int wrap_lines(TTF_Font *font, char in[][HINT_LEN], int nin,
+                      char out[][HINT_LEN], int max, int max_w, int *widest)
+{
+    int n = 0;
+    *widest = 0;
+    for (int i = 0; i < nin && n < max; i++) {
+        const char *p = in[i];
+        /* keep leading indentation on continuation lines */
+        int indent = 0;
+        while (p[indent] == ' ') indent++;
+        char cur[HINT_LEN] = "";
+        while (*p && n < max) {
+            const char *sp = strchr(p + (*p == ' '), ' ');
+            int wl = sp ? (int)(sp - p) : (int)strlen(p);
+            char trial[HINT_LEN];
+            snprintf(trial, sizeof trial, "%s%.*s", cur, wl, p);
+            int tw = 0, th = 0;
+            if (font) TTF_SizeUTF8(font, trial, &tw, &th);
+            if (tw > max_w && cur[0]) {
+                int cw = 0;
+                if (font) TTF_SizeUTF8(font, cur, &cw, &th);
+                if (cw > *widest) *widest = cw;
+                snprintf(out[n++], HINT_LEN, "%s", cur);
+                snprintf(cur, sizeof cur, "%*s", indent + 2, "");
+                while (*p == ' ') p++;
+                continue;
+            }
+            snprintf(cur, sizeof cur, "%s", trial);
+            p += wl;
+        }
+        if (cur[0] && n < max) {
+            int cw = 0, th;
+            if (font) TTF_SizeUTF8(font, cur, &cw, &th);
+            if (cw > *widest) *widest = cw;
+            snprintf(out[n++], HINT_LEN, "%s", cur);
+        }
+    }
+    return n;
+}
+
+static void draw_hint_text(TTF_Font *font, const char *s, int x, int y)
+{
+    if (!font || !s[0]) return;
+    SDL_Color black = { 0, 0, 0, 255 };
+    SDL_Surface *ts = TTF_RenderUTF8_Blended(font, s, black);
+    if (!ts) return;
+    SDL_Texture *tx = SDL_CreateTextureFromSurface(game.renderer, ts);
+    if (tx) {
+        SDL_Rect d = { x, y, ts->w, ts->h };
+        SDL_RenderCopy(game.renderer, tx, NULL, &d);
+        SDL_DestroyTexture(tx);
+    }
+    SDL_FreeSurface(ts);
+}
+
+/* A grey Win3.1 box of wrapped lines; first line bold as the heading. */
+static void draw_hint_box(char in[][HINT_LEN], int nin, int x, int y,
+                          int anchor_below, int max_w)
+{
+    TTF_Font *body = game.font_dlg ? game.font_dlg : game.font_small;
+    char out[HINT_LINES * 3][HINT_LEN];
+    int widest = 0;
+    int n = wrap_lines(body, in, nin, out, HINT_LINES * 3, max_w, &widest);
+    if (n <= 0) return;
+    int lh = body ? TTF_FontLineSkip(body) : 14;
+    int w = widest + 12, h = n * lh + 8;
+    if (anchor_below) { x += 14; y += 20; }
+    if (x + w > game.screen_w - 2) x = game.screen_w - 2 - w;
+    if (y + h > game.screen_h - 2) y = (anchor_below ? y - 28 : y) - h;
+    if (x < 2) x = 2;
+    if (y < 2) y = 2;
+    draw_win31_rect(x, y, w, h, 1);
+    SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
+    SDL_Rect border = { x - 1, y - 1, w + 2, h + 2 };
+    SDL_RenderDrawRect(game.renderer, &border);
+    for (int i = 0; i < n; i++)
+        draw_hint_text(i == 0 && game.font ? game.font : body, out[i],
+                       x + 6, y + 4 + i * lh);
+}
+
+static void render_tooltip(void)
+{
+    if (game.quit_confirm || game.disaster_modal || game.notice_modal ||
+        game.route_confirm || game.find_open)
+        return;
+    int x, y, world = 0;
+    if (game.tip_pinned) {
+        x = game.tip_x; y = game.tip_y; world = 1;
+    } else {
+        if (game.last_input_touch || touch_active(&game.touch) ||
+            game.dragging || game.cam_panning || game.win_dragging)
+            return;
+        if (SDL_GetTicks() - game.tip_moved_ms < TIP_DELAY_MS) return;
+        x = game.mouse_x; y = game.mouse_y;
+    }
+    char lines[HINT_LINES][HINT_LEN];
+    int n = tooltip_content(x, y, world, lines, HINT_LINES);
+    if (n <= 0) return;
+    int max_w = TIP_MAX_W < game.screen_w - 24 ? TIP_MAX_W : game.screen_w - 24;
+    draw_hint_box(lines, n, x, y, 1, max_w);
+}
+
+/* ---- Notes docked under the tenant info dialog (advice.ts) ---- */
+static int tenant_notes_lines(char lines[][HINT_LEN], int max)
+{
+    if (!game.inspect_open) return 0;
+    Tenant *t = tower_tenant(&game.tower, game.inspect_tid);
+    if (!t) return 0;
+    return hints_tenant_notes(&game.sim, &game.tower, t, lines, max);
+}
+
+static int notes_panel_rect(SDL_Rect *r)
+{
+    char lines[HINT_LINES][HINT_LEN];
+    int n = tenant_notes_lines(lines, HINT_LINES);
+    if (n <= 0) return 0;
+    Tenant *t = tower_tenant(&game.tower, game.inspect_tid);
+    TiLayout L; ti_build(t, &L);
+    TTF_Font *body = game.font_dlg ? game.font_dlg : game.font_small;
+    char out[HINT_LINES * 3][HINT_LEN];
+    int widest;
+    int w = L.w;
+    int k = wrap_lines(body, lines, n, out, HINT_LINES * 3, w - 12, &widest);
+    int lh = body ? TTF_FontLineSkip(body) : 14;
+    int h = WIN_TITLEBAR_H + k * lh + 8;
+    int x = game.inspect_x, y = game.inspect_y + L.h + 2;
+    if (y + h > game.screen_h) y = game.inspect_y - h - 2;   /* above */
+    if (y < MENU_BAR_H) {                                    /* beside */
+        y = game.inspect_y;
+        x = game.inspect_x + L.w + 2;
+        if (x + w > game.screen_w) x = game.inspect_x - w - 2;
+    }
+    *r = (SDL_Rect){ x, y, w, h };
+    return 1;
+}
+
+static void render_tenant_notes(void)
+{
+    SDL_Rect r;
+    if (!notes_panel_rect(&r)) return;
+    char lines[HINT_LINES][HINT_LEN];
+    int n = tenant_notes_lines(lines, HINT_LINES);
+    draw_win31_titlebar(r.x, r.y, r.w, "Notes");
+    draw_win31_rect(r.x, r.y + WIN_TITLEBAR_H, r.w, r.h - WIN_TITLEBAR_H, 1);
+    TTF_Font *body = game.font_dlg ? game.font_dlg : game.font_small;
+    char out[HINT_LINES * 3][HINT_LEN];
+    int widest;
+    int k = wrap_lines(body, lines, n, out, HINT_LINES * 3, r.w - 12, &widest);
+    int lh = body ? TTF_FontLineSkip(body) : 14;
+    for (int i = 0; i < k; i++)
+        draw_hint_text(body, out[i], r.x + 6, r.y + WIN_TITLEBAR_H + 4 + i * lh);
+}
 
 /* ---------- Responsive layout (port addition) ----------
  * The original's windows sit at fixed spots on a 640x480+ desktop. The

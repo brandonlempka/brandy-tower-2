@@ -9,6 +9,7 @@
 #include "twr.h"
 #include "view.h"
 #include "touch.h"
+#include "hints.h"
 
 static Tower tw;
 static GameSim sim;
@@ -3825,10 +3826,154 @@ static void test_touch(void)
     CHECK(tr.lp == 1 && tr.taps == 0, "held still 500ms: long-press, no tap");
 }
 
+/* The promotion gate as it was before game_promotion_needs: the needs-
+ * list refactor must agree with it on every flag combination. */
+static int legacy_gate(const PromotionFlags *f, int window, int target_star)
+{
+    switch (target_star) {
+    case 1: return 1;  /* Starting star, always OK */
+    case 2: return 1;  /* Just need population */
+    case 3:
+        /* Need security office (no clock gate at 2->3) */
+        return f->has_security;
+    case 4:
+        /* LevelUp 1148:007e, 3->4 branch (byte-verified 2026-07-09):
+         * suite (0xB92B) + recycling adequate (0xB92C) + VIP verdict
+         * (0xB923) + medical adequate (0xB92D) + the weekday-evening
+         * window. Metro is NOT required here — the old table had
+         * metro/recycling swapped and invented a "4 suites" count; one
+         * suite is the requirement. */
+        return f->has_suite &&
+               f->recycling_adequate &&
+               f->medical_adequate &&
+               f->vip_visited &&
+               window;
+    case 5:
+        /* 4->5 branch: metro ([0xB3E8] >= 0) + recycling adequate +
+         * medical adequate + the weekday-evening window. NO VIP re-check
+         * and no suite re-check — the binary reads neither 0xB923 nor
+         * 0xB92B here. */
+        return f->has_metro &&
+               f->recycling_adequate &&
+               f->medical_adequate &&
+               window;
+    case 6:
+        /* TOWER: special event, not automatic */
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+static int lines_contain(char lines[][HINT_LEN], int n, const char *needle)
+{
+    for (int i = 0; i < n; i++) if (strstr(lines[i], needle)) return 1;
+    return 0;
+}
+
+static void test_hints(void)
+{
+    printf("hints / explainers:\n");
+    char L[HINT_LINES][HINT_LEN];
+
+    /* the refactored gate == the old gate, exhaustively */
+    fresh();
+    int agree = 1;
+    for (int bits = 0; bits < 64; bits++)
+        for (int hour = 0; hour < 24; hour += 6)
+            for (int day = 0; day < 3; day++)
+                for (int target = 1; target <= 6; target++) {
+                    PromotionFlags f = {
+                        .has_security = bits & 1, .has_suite = !!(bits & 2),
+                        .recycling_adequate = !!(bits & 4),
+                        .has_metro = !!(bits & 8),
+                        .medical_adequate = !!(bits & 16),
+                        .vip_visited = !!(bits & 32) };
+                    sim.promo = f;
+                    sim.hour = hour;
+                    tw.day = day;
+                    int window = (hour >= 17 || hour < 7) && !game_is_weekend(&tw);
+                    if (game_check_promotion(&sim, &tw, target) !=
+                        legacy_gate(&f, window, target)) agree = 0;
+                }
+    CHECK(agree, "needs-list gate == pre-refactor gate (all flags/times)");
+
+    /* locked item says when it unlocks; sandbox doesn't */
+    fresh();
+    sim.mode = MODE_CAMPAIGN;
+    tw.star_rating = 1;
+    const char *why = hints_unavailable(&sim, &tw, ITEM_METRO);
+    CHECK(why && strstr(why, "4 stars"), "metro locked: 'Unlocks at 4 stars'");
+    sim.mode = MODE_SANDBOX;
+    CHECK(hints_unavailable(&sim, &tw, ITEM_METRO) == NULL, "sandbox: nothing locked");
+    int n = hints_tool(&sim, &tw, ITEM_ELEVATOR_EXPRESS, L, HINT_LINES);
+    CHECK(n >= 2 && strstr(L[0], "$400,000") &&
+          lines_contain(L, n, "lobby floor"), "express tooltip: price + lobby rule");
+
+    /* pool-full agrees with tower_place */
+    fresh();
+    sim.mode = MODE_SANDBOX;
+    place(ITEM_FLOOR, 0, 100);
+    CHECK(!tower_pool_full(&tw, ITEM_METRO), "no metro yet: pool open");
+    uint16_t m = tower_place(&tw, ITEM_METRO, -3, 105);
+    if (m) {
+        CHECK(tower_pool_full(&tw, ITEM_METRO), "metro built: pool full");
+        CHECK(!tower_place(&tw, ITEM_METRO, -3, 140) &&
+              strstr(tower_reject_reason(), "Only one Metro"),
+              "tower_place refuses the 2nd metro with the original wording");
+        why = hints_unavailable(&sim, &tw, ITEM_METRO);
+        CHECK(why && strstr(why, "One per tower"), "explainer says why");
+    } else {
+        printf("  (metro placement unavailable in fixture: %s)\n", tower_reject_reason());
+    }
+
+    /* rating checklist: 3 stars wants security, ticked when built */
+    fresh();
+    tw.star_rating = 2;
+    n = hints_rating(&sim, &tw, L, HINT_LINES);
+    CHECK(lines_contain(L, n, "\xc3\x97 A Security office"), "2 stars: security unticked");
+    place(ITEM_SECURITY, 1, BX);
+    n = hints_rating(&sim, &tw, L, HINT_LINES);
+    CHECK(lines_contain(L, n, "\xe2\x9c\x93 A Security office"), "security built: ticked");
+    char one[256];
+    hints_next_rating(&sim, &tw, one, sizeof one);
+    CHECK(strstr(one, "3 stars needs") && strstr(one, "population") &&
+          !strstr(one, "Security"), "next-rating line lists only what's missing");
+
+    /* tenant notes */
+    fresh();
+    place(ITEM_FLOOR, 1, BX); place(ITEM_FLOOR, 2, BX);
+    uint16_t lone = place(ITEM_OFFICE, 3, BX);        /* no stairs/lift */
+    run_days(1);
+    Tenant *o = tenant(lone);
+    n = o ? hints_tenant_notes(&sim, &tw, o, L, HINT_LINES) : 0;
+    CHECK(n >= 1 && strstr(L[0], "Nobody can get here"), "unreachable office: connect it");
+
+    fresh();
+    place(ITEM_FLOOR, 1, BX);
+    uint16_t room = place(ITEM_HOTEL_SINGLE, 1, BX);
+    place(ITEM_STAIRS, 0, BX + 20);
+    run_days(1);
+    Tenant *h = tenant(room);
+    if (h) {
+        h->condition = ROOM_DIRTY;
+        n = hints_tenant_notes(&sim, &tw, h, L, HINT_LINES);
+        CHECK(lines_contain(L, n, "no Housekeeping"), "dirty room, no housekeeping: build one");
+        h->condition = ROOM_INFESTED;
+        n = hints_tenant_notes(&sim, &tw, h, L, HINT_LINES);
+        CHECK(lines_contain(L, n, "Demolish"), "infested room: demolish");
+        h->condition = ROOM_CLEAN;
+        h->rent_class = 3;
+        n = hints_tenant_notes(&sim, &tw, h, L, HINT_LINES);
+        CHECK(lines_contain(L, n, "Very Low rent"), "very low rent always satisfies");
+    }
+}
+
 int main(void)
 {
     test_view_zoom();
     test_touch();
+    test_hints();
     test_stairs();
     test_flavor();
     test_floor_fill();

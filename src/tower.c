@@ -170,6 +170,52 @@ void tower_person_name_clear(Tower *tower, uint16_t tid, int member)
 
 /* Count elevator groups the way the transport collector does: one group per
  * contiguous same-type vertical run of shaft cells (left column only). */
+/* The original's fixed pools (one metro, one cathedral, 16 venues, 64
+ * stairs+escalators, 512 shops/food, 512 parking spaces, 10 medical, 10
+ * security, 24 shaft groups). tower_place refuses on exactly this test;
+ * the toolbox explainer reads it to say "the tower will take no more".
+ * For elevators it answers "is a NEW shaft group possible" — extending
+ * an existing shaft never counts against the pool. */
+int tower_pool_full(const Tower *tower, ItemType type)
+{
+    if (item_is_elevator(type))
+        return tower_shaft_group_count(tower) >= TOWER_MAX_SHAFT_GROUPS;
+    int metros = 0, cathedrals = 0, venues = 0, walks = 0;
+    int commercial = 0, medicals = 0, securities = 0, spaces = 0;
+    for (int i = 0; i < tower->tenant_count; i++) {
+        switch (tower->tenants[i].type) {
+        case ITEM_METRO:      metros++;     break;
+        case ITEM_CATHEDRAL:  cathedrals++; break;
+        case ITEM_CINEMA:
+        case ITEM_PARTY_HALL: venues++;     break;
+        case ITEM_STAIRS:
+        case ITEM_ESCALATOR:  walks++;      break;
+        case ITEM_RESTAURANT:
+        case ITEM_SHOP:
+        case ITEM_FAST_FOOD:  commercial++; break;
+        case ITEM_MEDICAL:    medicals++;   break;
+        case ITEM_SECURITY:   securities++; break;
+        case ITEM_PARKING:    spaces++;     break;
+        default: break;
+        }
+    }
+    switch (type) {
+    case ITEM_METRO:      return metros > 0;
+    case ITEM_CATHEDRAL:  return cathedrals > 0;
+    case ITEM_CINEMA:
+    case ITEM_PARTY_HALL: return venues >= TOWER_MAX_VENUES;
+    case ITEM_STAIRS:
+    case ITEM_ESCALATOR:  return walks >= TOWER_MAX_WALK_TRANSPORTS;
+    case ITEM_RESTAURANT:
+    case ITEM_SHOP:
+    case ITEM_FAST_FOOD:  return commercial >= 512;
+    case ITEM_MEDICAL:    return medicals >= 10;
+    case ITEM_SECURITY:   return securities >= 10;
+    case ITEM_PARKING:    return spaces >= 512;
+    default:              return 0;
+    }
+}
+
 int tower_shaft_group_count(const Tower *tower)
 {
     int count = 0;
@@ -685,57 +731,15 @@ int tower_can_place(Tower *tower, ItemType type, int floor, int x)
      * party halls, [0xB400]), and ONE shared 64-record table for stairs
      * and escalators together (0xBD70 — the reject message differs by
      * type, the table doesn't). */
-    if (type == ITEM_METRO || type == ITEM_CATHEDRAL || type == ITEM_CINEMA ||
-        type == ITEM_PARTY_HALL || type == ITEM_STAIRS || type == ITEM_ESCALATOR ||
-        type == ITEM_RESTAURANT || type == ITEM_SHOP || type == ITEM_FAST_FOOD ||
-        type == ITEM_MEDICAL || type == ITEM_SECURITY) {
-        int metros = 0, cathedrals = 0, venues = 0, walks = 0;
-        int commercial = 0, medicals = 0, securities = 0;
-        for (int i = 0; i < tower->tenant_count; i++) {
-            switch (tower->tenants[i].type) {
-            case ITEM_METRO:      metros++;     break;
-            case ITEM_CATHEDRAL:  cathedrals++; break;
-            case ITEM_CINEMA:
-            case ITEM_PARTY_HALL: venues++;     break;
-            case ITEM_STAIRS:
-            case ITEM_ESCALATOR:  walks++;      break;
-            case ITEM_RESTAURANT:
-            case ITEM_SHOP:
-            case ITEM_FAST_FOOD:  commercial++; break;
-            case ITEM_MEDICAL:    medicals++;   break;
-            case ITEM_SECURITY:   securities++; break;
-            default: break;
-            }
-        }
-        if (type == ITEM_METRO && metros > 0)
-            REJECT("Only one Metro Station allowed");
-        if (type == ITEM_CATHEDRAL && cathedrals > 0)
-            REJECT("Only one Cathedral allowed");
-        if ((type == ITEM_CINEMA || type == ITEM_PARTY_HALL) &&
-            venues >= TOWER_MAX_VENUES)
-            REJECT("Item no longer available");
-        if ((type == ITEM_STAIRS || type == ITEM_ESCALATOR) &&
-            walks >= TOWER_MAX_WALK_TRANSPORTS)
-            REJECT(type == ITEM_STAIRS ? "No more stairs available"
-                                       : "No more escalators available");
-        /* Fixed-table caps from the pass-3 dispatch trace (2026-07-29):
-         * restaurants + shops + fast food share ONE 512-record table
-         * ([0xB3F8] < 0x200); medical and security cap at 10 each.
-         * Recycling is genuinely uncapped in the EXE. */
-        if ((type == ITEM_RESTAURANT || type == ITEM_SHOP ||
-             type == ITEM_FAST_FOOD) && commercial >= 512)
-            REJECT("Item no longer available");
-        if (type == ITEM_MEDICAL && medicals >= 10)
-            REJECT("Item no longer available");
-        if (type == ITEM_SECURITY && securities >= 10)
-            REJECT("Item no longer available");
+    if (type != ITEM_PARKING && !item_is_elevator(type) &&
+        tower_pool_full(tower, type)) {
+        if (type == ITEM_METRO)     REJECT("Only one Metro Station allowed");
+        if (type == ITEM_CATHEDRAL) REJECT("Only one Cathedral allowed");
+        if (type == ITEM_STAIRS)    REJECT("No more stairs available");
+        if (type == ITEM_ESCALATOR) REJECT("No more escalators available");
+        REJECT("Item no longer available");
     }
 
-    /* Recycling proximity (TrashT 1088:02c8, comparison C4): every center
-     * after the first must land NEAR an existing one — the new span
-     * expanded ±25 cells must reach an existing center on floors −2..+1
-     * relative to the new base. No overlap required, adjacency is enough;
-     * the first center places freely. */
     if (type == ITEM_RECYCLING) {
         int have = 0, near = 0;
         int w = ITEM_WIDTH[type];
@@ -813,9 +817,10 @@ int tower_can_place(Tower *tower, ItemType type, int floor, int x)
             if (t->type == ITEM_RAMP && t->floor == floor) has_ramp = 1;
             if (t->type == ITEM_PARKING) spaces++;
         }
+        (void)spaces;
         if (!has_ramp)
             REJECT("Parking Ramps must be placed on this level");
-        if (spaces >= 512)
+        if (tower_pool_full(tower, ITEM_PARKING))
             REJECT("Item no longer available");
     }
     
