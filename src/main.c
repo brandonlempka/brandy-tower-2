@@ -26,6 +26,7 @@
 #include "sound_hook.h"
 #include "strings.h"
 #include "view.h"
+#include "touch.h"
 
 /* ---------- Window / display ---------- */
 #define WINDOW_W    960
@@ -512,6 +513,12 @@ typedef struct {
      * the top of the next frame so JS never re-enters SDL mid-ASYNCIFY. */
     int             pending_view_w, pending_view_h;
     int             pending_zoom, pending_zoom_x, pending_zoom_y;
+    /* Touch (touch.c). A tap with a build tool doesn't build at once — it
+     * parks the ghost and asks (Build / Cancel / nudge), BrandyTower's
+     * placement confirm; a drag builds straight away. */
+    TouchState      touch;
+    int             place_pending, place_floor, place_cell;
+    int             touch_drag_btn;  /* synthesized left button is down */
     int             win_drag_ox;     /* Mouse offset from window origin at drag start */
     int             win_drag_oy;
     
@@ -1103,6 +1110,9 @@ static void zoom_step_center(int dir)
 }
 
 static void update_px_scale(void);            /* responsive layout, below */
+static void touch_event(const SDL_Event *ev); /* touch input, below */
+static void clamp_win(int *x, int *y, int w, int h);
+static void render_place_confirm(void);
 static void apply_view_size(int w, int h);
 
 /* Read the presented frame into a new surface sized to the renderer's
@@ -8410,6 +8420,10 @@ static void render(void)
      * with screen_w/h temporarily set to the virtual size — every world
      * renderer sizes itself off them — and is then blitted whole-pixel
      * (nearest) onto the screen. UI windows below always draw at 1x. */
+    if (game.place_pending) {       /* touch: the ghost stays where parked */
+        game.mouse_floor = game.place_floor;
+        game.mouse_cell = game.place_cell;
+    }
     int zoomed = game.zoom_idx != VIEW_ZOOM_DEFAULT;
     int real_w = game.screen_w, real_h = game.screen_h;
     if (zoomed) {
@@ -8486,6 +8500,7 @@ static void render(void)
     render_name_editor();
     render_event_alert();
     render_find_dialog();      /* modal: above the popups */
+    render_place_confirm();    /* touch placement: Build / Cancel / nudge */
     render_menu_bar();         /* Win3.1 top bar + its open dropdown */
     render_dropdown();
     render_disaster_modal();   /* on top of everything — it's modal */
@@ -10060,6 +10075,12 @@ static void handle_event(SDL_Event *ev)
         break;
     }
         
+    case SDL_FINGERDOWN:
+    case SDL_FINGERMOTION:
+    case SDL_FINGERUP:
+        touch_event(ev);
+        break;
+
     case SDL_WINDOWEVENT:
 #ifndef __EMSCRIPTEN__
         /* Web canvas is fixed 960x720 — browser-side CSS resize events
@@ -10190,6 +10211,318 @@ static void snd_tally_dump(void)
 /* Headless capture mode: when CT_SOUND_CAPTURE=<path> is set the game opens no
  * audio device, records the sim's sounds, and writes a WAV at exit. */
 static int g_sound_capture = 0;
+
+/* ---------- Touch input (port addition; gestures in touch.c) ----------
+ * Every gesture ends up as the mouse events the game already understands,
+ * fed through handle_event, so the menus, windows, dialogs and build
+ * tools need no touch-specific code of their own. */
+static void synth_motion(int x, int y)
+{
+    SDL_Event e;
+    memset(&e, 0, sizeof e);
+    e.type = SDL_MOUSEMOTION;
+    e.motion.which = SDL_TOUCH_MOUSEID;
+    e.motion.x = x;
+    e.motion.y = y;
+    e.motion.state = game.touch_drag_btn ? SDL_BUTTON_LMASK : 0;
+    handle_event(&e);
+}
+
+static void synth_button(int down, int x, int y)
+{
+    SDL_Event e;
+    memset(&e, 0, sizeof e);
+    e.type = down ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
+    e.button.which = SDL_TOUCH_MOUSEID;
+    e.button.button = SDL_BUTTON_LEFT;
+    e.button.state = down ? SDL_PRESSED : SDL_RELEASED;
+    e.button.clicks = 1;
+    e.button.x = x;
+    e.button.y = y;
+    game.touch_drag_btn = down;
+    handle_event(&e);
+}
+
+static void synth_click(int x, int y)
+{
+    synth_motion(x, y);
+    synth_button(1, x, y);
+    synth_button(0, x, y);
+}
+
+/* Does the UI (not the tower) own this screen point? */
+static int ui_owns_point(int x, int y)
+{
+    if (game.quit_confirm || game.route_confirm || game.notice_modal ||
+        game.disaster_modal || game.find_open || game.name_edit_open ||
+        game.movie_dlg_open || game.menu_open >= 0)
+        return 1;
+    if (menu_bar_hit_test(x, y) >= 0) return 1;
+    if (point_in_any_window(x, y)) return 1;
+    if (game.win_toolbar && x >= game.tool_x && x < game.tool_x + TOOL_WIN_W &&
+        y >= game.tool_y && y < game.tool_y + tool_win_height())
+        return 1;
+    if (game.person_open && point_in_rect(x, y, person_popup_rect())) return 1;
+    if (game.inspect_open) {
+        Tenant *t = tower_tenant(&game.tower, game.inspect_tid);
+        if (t) {
+            TiLayout L; ti_build(t, &L);
+            SDL_Rect r = { game.inspect_x, game.inspect_y, L.w, L.h };
+            if (point_in_rect(x, y, r)) return 1;
+        }
+    }
+    return 0;
+}
+
+static int build_tool_active(void)
+{
+    return game.build_type != ITEM_NONE && !game.demolish_mode &&
+           !game.finger_mode && !game.inspect_mode && !game.elv_edit_mode;
+}
+
+/* A shaft's motor room or pit under (floor, cell)? (try_cap_drag's test,
+ * without arming the drag) */
+static int cap_at(int floor, int cell)
+{
+    PeopleSim *ps = &game.sim.people;
+    int fidx = floor_to_index(floor);
+    for (int i = 0; i < ps->shaft_count; i++) {
+        ElevatorShaft *sh = &ps->shafts[i];
+        if (!sh->active) continue;
+        if (cell < sh->x || cell >= sh->x + ITEM_WIDTH[sh->type]) continue;
+        if (fidx == sh->hi + 1 || fidx == sh->lo - 1) return 1;
+    }
+    return 0;
+}
+
+/* ---- Placement confirm: a small Win3.1 box under the parked ghost ---- */
+#define PC_W     136
+#define PC_BTN   24
+#define PC_H     (WIN_TITLEBAR_H + 4 + PC_BTN + 4 + 22 + 6)
+
+static void place_confirm_origin(int *ox, int *oy)
+{
+    int gx, gy;
+    grid_to_screen(game.place_floor, game.place_cell, &gx, &gy);
+    gx = (int)(gx * game.zoom);
+    gy = (int)(gy * game.zoom);
+    int x = gx - PC_W / 2;
+    int y = gy + (int)(CELL_H * game.zoom) + 8;          /* below the row */
+    if (y + PC_H > game.screen_h) y = gy - (int)(CELL_H * game.zoom) - PC_H - 8;
+    clamp_win(&x, &y, PC_W, PC_H);
+    *ox = x; *oy = y;
+}
+
+/* Button rects: 0..3 = left/up/down/right nudges, 4 = Build, 5 = Cancel */
+static SDL_Rect place_confirm_button(int i)
+{
+    int ox, oy;
+    place_confirm_origin(&ox, &oy);
+    int ry = oy + WIN_TITLEBAR_H + 4;
+    if (i < 4) {
+        int gap = (PC_W - 4 * PC_BTN) / 5;
+        return (SDL_Rect){ ox + gap + i * (PC_BTN + gap), ry, PC_BTN, PC_BTN };
+    }
+    int bw = (PC_W - 18) / 2;
+    return (SDL_Rect){ ox + 6 + (i - 4) * (bw + 6), ry + PC_BTN + 4, bw, 22 };
+}
+
+static void draw_nudge_arrow(SDL_Rect r, int dir)   /* 0 L, 1 U, 2 D, 3 R */
+{
+    int cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+    SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
+    for (int k = 0; k <= 6; k++) {
+        switch (dir) {
+        case 0: SDL_RenderDrawLine(game.renderer, cx - 4 + k, cy - k, cx - 4 + k, cy + k); break;
+        case 3: SDL_RenderDrawLine(game.renderer, cx + 4 - k, cy - k, cx + 4 - k, cy + k); break;
+        case 1: SDL_RenderDrawLine(game.renderer, cx - k, cy - 4 + k, cx + k, cy - 4 + k); break;
+        default: SDL_RenderDrawLine(game.renderer, cx - k, cy + 4 - k, cx + k, cy + 4 - k); break;
+        }
+    }
+}
+
+static void render_place_confirm(void)
+{
+    if (!game.place_pending) return;
+    if (!build_tool_active()) { game.place_pending = 0; return; }
+    int ox, oy;
+    place_confirm_origin(&ox, &oy);
+    draw_win31_titlebar(ox, oy, PC_W, tower_item_name(game.build_type));
+    draw_win31_rect(ox, oy + WIN_TITLEBAR_H, PC_W, PC_H - WIN_TITLEBAR_H, 1);
+    for (int i = 0; i < 4; i++) {
+        SDL_Rect r = place_confirm_button(i);
+        draw_btn31(r, "", 0, 1);
+        draw_nudge_arrow(r, i);
+    }
+    draw_btn31(place_confirm_button(4), "Build", 1, 1);
+    draw_btn31(place_confirm_button(5), "Cancel", 0, 1);
+}
+
+/* Park the ghost at the point a build tool was tapped. */
+static void place_confirm_at(int x, int y)
+{
+    int f, c;
+    mouse_to_grid(x, y, &f, &c);
+    game.place_pending = 1;
+    game.place_floor = f;
+    game.place_cell = c;
+}
+
+/* Returns 1 if the tap landed on the confirm box. */
+static int place_confirm_tap(int x, int y)
+{
+    if (!game.place_pending) return 0;
+    for (int i = 0; i < 6; i++) {
+        if (!point_in_rect(x, y, place_confirm_button(i))) continue;
+        switch (i) {
+        case 0: game.place_cell--;  break;
+        case 1: game.place_floor++; break;
+        case 2: game.place_floor--; break;
+        case 3: game.place_cell++;  break;
+        case 4: {
+            /* Build: a click at the parked cell through the normal path.
+             * The press point only has to miss every window; the build
+             * itself reads mouse_floor/mouse_cell. */
+            int gx, gy;
+            grid_to_screen(game.place_floor, game.place_cell, &gx, &gy);
+            gx = (int)((gx + CELL_W / 2) * game.zoom);
+            gy = (int)((gy + CELL_H / 2) * game.zoom);
+            game.place_pending = 0;
+            synth_button(1, gx, gy);   /* no motion: keep the parked cell */
+            synth_button(0, gx, gy);
+            break;
+        }
+        default: game.place_pending = 0; break;
+        }
+        if (game.place_cell < 0) game.place_cell = 0;
+        if (game.place_cell >= TOWER_WIDTH) game.place_cell = TOWER_WIDTH - 1;
+        return 1;
+    }
+    {   /* the box's body swallows near-misses */
+        int ox, oy;
+        place_confirm_origin(&ox, &oy);
+        SDL_Rect body = { ox, oy, PC_W, PC_H };
+        if (point_in_rect(x, y, body)) return 1;
+    }
+    return 0;
+}
+
+static void tooltip_long_press(int x, int y);   /* tooltips, below */
+
+static void th_tap(void *ctx, int x, int y)
+{
+    (void)ctx;
+    if (place_confirm_tap(x, y)) return;
+    int popup = game.inspect_open || game.person_open;
+    if (build_tool_active() && !popup && !ui_owns_point(x, y) &&
+        !game.sim.event.active) {
+        place_confirm_at(x, y);          /* ask before building */
+        synth_motion(x, y);
+        return;
+    }
+    synth_click(x, y);
+}
+
+static int th_claims_drag(void *ctx, int x, int y)
+{
+    (void)ctx;
+    if (ui_owns_point(x, y)) return 1;   /* drag a window, a slider... */
+    if (game.sim.event.active) return 0;
+    if (build_tool_active()) return 1;   /* lay a row / a floor run */
+    int f, c;
+    mouse_to_grid(x, y, &f, &c);
+    return !game.demolish_mode && !game.inspect_mode && cap_at(f, c);
+}
+
+static void th_drag_start(void *ctx, int x, int y)
+{
+    (void)ctx;
+    game.place_pending = 0;
+    synth_motion(x, y);
+    synth_button(1, x, y);
+}
+
+static void th_drag_move(void *ctx, int x, int y) { (void)ctx; synth_motion(x, y); }
+
+static void th_drag_end(void *ctx, int x, int y)
+{
+    (void)ctx;
+    synth_motion(x, y);
+    synth_button(0, x, y);
+}
+
+static void th_drag_cancel(void *ctx)
+{
+    (void)ctx;
+    /* A cap drag and a window drag were live all along: let them finish
+     * where they are. A build drag is abandoned, not committed. */
+    if (game.cap_drag || game.win_dragging) {
+        synth_button(0, game.mouse_x, game.mouse_y);
+        return;
+    }
+    game.dragging = 0;
+    game.touch_drag_btn = 0;
+}
+
+static void th_pan(void *ctx, float dx, float dy)
+{
+    (void)ctx;
+    game.cam_fx -= dx / game.zoom;
+    game.cam_fy -= dy / game.zoom;
+    game.cam_anim = 0;
+}
+
+static void th_zoom(void *ctx, int dir, int cx, int cy)
+{
+    (void)ctx;
+    zoom_step(dir, cx, cy);
+}
+
+static void th_long_press(void *ctx, int x, int y)
+{
+    (void)ctx;
+    tooltip_long_press(x, y);
+}
+
+static const TouchHandlers TOUCH_HANDLERS = {
+    .ctx = NULL,
+    .tap = th_tap,
+    .drag_start = th_drag_start,
+    .drag_move = th_drag_move,
+    .drag_end = th_drag_end,
+    .drag_cancel = th_drag_cancel,
+    .pan = th_pan,
+    .zoom_step = th_zoom,
+    .long_press = th_long_press,
+    .claims_drag = th_claims_drag,
+};
+
+static void touch_event(const SDL_Event *ev)
+{
+    /* A Mac trackpad reports its fingers too; only a touchscreen (direct
+     * touch) is a pointer. Trackpad pinch-zoom comes as Ctrl+wheel. */
+#if SDL_VERSION_ATLEAST(2, 0, 10)
+    if (SDL_GetTouchDeviceType(ev->tfinger.touchId) != SDL_TOUCH_DEVICE_DIRECT)
+        return;
+#endif
+    float x = ev->tfinger.x * game.screen_w;
+    float y = ev->tfinger.y * game.screen_h;
+    long long id = (long long)ev->tfinger.fingerId;
+    switch (ev->type) {
+    case SDL_FINGERDOWN:
+        touch_down(&game.touch, &TOUCH_HANDLERS, id, x, y, SDL_GetTicks());
+        break;
+    case SDL_FINGERMOTION:
+        touch_move(&game.touch, &TOUCH_HANDLERS, id, x, y);
+        break;
+    case SDL_FINGERUP:
+        touch_up(&game.touch, &TOUCH_HANDLERS, id, x, y);
+        break;
+    }
+}
+
+/* Long-press: until the tooltip layer lands, just move the cursor there. */
+static void tooltip_long_press(int x, int y) { synth_motion(x, y); }
 
 /* ---------- Responsive layout (port addition) ----------
  * The original's windows sit at fixed spots on a 640x480+ desktop. The
@@ -10420,6 +10753,11 @@ int main(int argc, char *argv[])
     }
     exe_strings_init(&game.exe);   /* 0x7f06 string tables + dialog texts */
     
+    /* Touch is handled as gestures (touch.c), not SDL's emulated mouse —
+     * otherwise every pan would also be a build drag. */
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+    SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
+
     /* Initialize SDL */
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -11432,6 +11770,7 @@ int main(int argc, char *argv[])
     int frame = 0;
     while (game.running) {
         apply_pending_requests();
+        touch_tick(&game.touch, &TOUCH_HANDLERS, SDL_GetTicks());
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             handle_event(&ev);

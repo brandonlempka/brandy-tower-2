@@ -8,6 +8,7 @@
 #include "game.h"
 #include "twr.h"
 #include "view.h"
+#include "touch.h"
 
 static Tower tw;
 static GameSim sim;
@@ -3758,9 +3759,76 @@ static void test_view_zoom(void)
     CHECK(ok, "zoom about a point keeps it fixed, every step pair");
 }
 
+/* touch.c gestures (BrandyTower pointer.ts semantics) */
+static struct { int taps, dstart, dmove, dend, dcancel, zin, zout, lp;
+                float pan_x, pan_y; int claim; } tr;
+static void t_tap(void *c, int x, int y) { (void)c; (void)x; (void)y; tr.taps++; }
+static void t_ds(void *c, int x, int y) { (void)c; (void)x; (void)y; tr.dstart++; }
+static void t_dm(void *c, int x, int y) { (void)c; (void)x; (void)y; tr.dmove++; }
+static void t_de(void *c, int x, int y) { (void)c; (void)x; (void)y; tr.dend++; }
+static void t_dc(void *c) { (void)c; tr.dcancel++; }
+static void t_pan(void *c, float dx, float dy) { (void)c; tr.pan_x += dx; tr.pan_y += dy; }
+static void t_zoom(void *c, int d, int x, int y) { (void)c; (void)x; (void)y; if (d > 0) tr.zin++; else tr.zout++; }
+static void t_lp(void *c, int x, int y) { (void)c; (void)x; (void)y; tr.lp++; }
+static int  t_claim(void *c, int x, int y) { (void)c; (void)x; (void)y; return tr.claim; }
+
+static void test_touch(void)
+{
+    printf("touch gestures:\n");
+    TouchHandlers h = { NULL, t_tap, t_ds, t_dm, t_de, t_dc, t_pan, t_zoom, t_lp, t_claim };
+    TouchState s;
+
+    memset(&tr, 0, sizeof tr); touch_reset(&s);
+    touch_down(&s, &h, 1, 100, 100, 0);
+    touch_move(&s, &h, 1, 104, 103);            /* under the threshold */
+    touch_up(&s, &h, 1, 104, 103);
+    CHECK(tr.taps == 1 && tr.dstart == 0 && tr.pan_x == 0, "small wobble is a tap");
+
+    memset(&tr, 0, sizeof tr); touch_reset(&s); tr.claim = 1;
+    touch_down(&s, &h, 1, 100, 100, 0);
+    touch_move(&s, &h, 1, 130, 100);
+    touch_move(&s, &h, 1, 160, 100);
+    touch_up(&s, &h, 1, 160, 100);
+    CHECK(tr.dstart == 1 && tr.dmove == 2 && tr.dend == 1 && tr.taps == 0,
+          "claimed drag builds: start, moves, end, no tap");
+
+    memset(&tr, 0, sizeof tr); touch_reset(&s); tr.claim = 0;
+    touch_down(&s, &h, 1, 100, 100, 0);
+    touch_move(&s, &h, 1, 130, 100);
+    touch_move(&s, &h, 1, 150, 90);
+    touch_up(&s, &h, 1, 150, 90);
+    CHECK(tr.dstart == 0 && tr.pan_x == 50 && tr.pan_y == -10 && tr.taps == 0,
+          "unclaimed drag pans the full distance");
+
+    memset(&tr, 0, sizeof tr); touch_reset(&s); tr.claim = 1;
+    touch_down(&s, &h, 1, 100, 100, 0);
+    touch_move(&s, &h, 1, 140, 100);            /* building... */
+    touch_down(&s, &h, 2, 300, 100, 50);        /* ...second finger */
+    CHECK(tr.dcancel == 1 && tr.dend == 0, "second finger cancels, not commits, a drag");
+    touch_move(&s, &h, 2, 400, 100);            /* spread 160 -> 260 */
+    CHECK(tr.zin == 1 && tr.zout == 0, "pinch out 1.6x = one zoom step in");
+    touch_move(&s, &h, 2, 230, 100);            /* spread -> 90 */
+    CHECK(tr.zout >= 1, "pinch in zooms out");
+    touch_up(&s, &h, 2, 230, 100);
+    int ds0 = tr.dstart; float px0 = tr.pan_x;
+    touch_move(&s, &h, 1, 120, 120);
+    touch_up(&s, &h, 1, 120, 120);
+    CHECK(tr.taps == 0 && tr.dstart == ds0 && tr.pan_x != px0,
+          "finger left after a pinch pans, never taps/builds");
+
+    memset(&tr, 0, sizeof tr); touch_reset(&s);
+    touch_down(&s, &h, 1, 100, 100, 1000);
+    touch_tick(&s, &h, 1300);
+    CHECK(tr.lp == 0, "no long-press before 500ms");
+    touch_tick(&s, &h, 1500);
+    touch_up(&s, &h, 1, 100, 100);
+    CHECK(tr.lp == 1 && tr.taps == 0, "held still 500ms: long-press, no tap");
+}
+
 int main(void)
 {
     test_view_zoom();
+    test_touch();
     test_stairs();
     test_flavor();
     test_floor_fill();
