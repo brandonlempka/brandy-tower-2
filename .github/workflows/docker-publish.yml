@@ -1,0 +1,77 @@
+name: Create and publish a Docker image
+
+# Every push to master: build the wasm bundle into an nginx image, push it to
+# GitHub's container registry, then ask Watchtower on the home server to pull
+# it. Pull requests only check that the image builds.
+on:
+  push:
+    branches: ['master']
+  pull_request:
+    branches: ['master']
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so `git describe` matches local builds
+      - name: Compute build version
+        id: version
+        run: echo "ct_version=$(git describe --always --dirty)" >> "$GITHUB_OUTPUT"
+      - name: Log in to the Container registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Tags: `latest` and `master` for the newest build, and the commit's short sha
+      # to roll back to. The action lower-cases the name, which ghcr.io requires.
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@9ec57ed1fcdbf14dcef7dfbe97b2010124a938b7
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha
+      # arm64 for the Raspberry Pi, amd64 for anything else.
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@f2a1d5e99d037542a71f64918e516c093c6f3fc4
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          platforms: linux/amd64,linux/arm64
+          build-args: CT_VERSION=${{ steps.version.outputs.ct_version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Update Docker Images
+        if: github.event_name != 'pull_request'
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: 'https://watchtower.brandonlempka.com/v1/update'
+          customHeaders: '{"Authorization":"Bearer ${{ secrets.WATCHTOWER_API_TOKEN }}"}'
+          method: 'POST'
+          preventFailureOnNoResponse: true
+          timeout: 60000

@@ -1,0 +1,9 @@
+# Allowlist: the web build needs only the Makefile, src/ and web/. Everything
+# else (ISOs, rars, backups, screenshots) stays out of the build context.
+*
+!Makefile
+!src
+!web
+web/dist
+web/dev-assets
+src/**/*.o
