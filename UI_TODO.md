@@ -112,6 +112,16 @@
   confirm box. `src/touch.c` (+ `tests/web/probe_touch.js`)
 - [x] Tooltips + explainers (tools, star ladder, tenant Notes panel).
   `src/hints.c`; `game_promotion_needs()` shared with the real gate.
+- [x] Map-view wash (2026-10-31): Eval / Rent / Hotel tint every room in
+  the main view like BrandyTower's evaluation overlay; minimap and wash
+  share `src/overlay.c` (+ `test_map_overlay` in test_sim.c). View → Eval
+  Overlay reaches it without the minimap.
+- [x] Optional Modern UI skin (2026-10-31): Options → Modern UI, dark glass,
+  same geometry and hit-tests; classic frame verified byte-identical across
+  the off-screen capture set. `src/ui_skin.c` (+ `tests/web/probe_modern_ui.js`)
+- [ ] Modern UI follow-ups: redraw the elevator and finance dialogs
+  procedurally (today: original bitmaps in a glass frame); a dark-glass
+  tenant-picture frame and analytics plot palette.
 - [ ] Real-device pass on iOS Safari and an Android phone (tested so far in
   desktop Chrome with an emulated phone and synthetic touch events).
 

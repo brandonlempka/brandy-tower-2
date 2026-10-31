@@ -28,6 +28,41 @@
 #include "view.h"
 #include "touch.h"
 #include "hints.h"
+#include "overlay.h"
+#include "ui_skin.h"
+
+/* Modern UI colour remap (ui_skin.h, layer 2): every draw colour and text
+ * colour in this file passes through the skin. Identity unless the modern
+ * skin is on AND the UI pass is drawing, so the classic frame and the
+ * world pass are untouched. */
+static inline int ct_set_draw_color(SDL_Renderer *r, Uint8 cr, Uint8 cg,
+                                    Uint8 cb, Uint8 ca)
+{
+    ui_remap_fill(&cr, &cg, &cb, ca);
+    return SDL_SetRenderDrawColor(r, cr, cg, cb, ca);
+}
+#define SDL_SetRenderDrawColor ct_set_draw_color
+#define TTF_RenderText_Blended(f, t, ...) \
+    TTF_RenderText_Blended((f), (t), ui_ink(__VA_ARGS__))
+#define TTF_RenderUTF8_Blended(f, t, ...) \
+    TTF_RenderUTF8_Blended((f), (t), ui_ink(__VA_ARGS__))
+/* Draw the modern version of a dialog primitive: the skin is on and the
+ * remap is live (the bitmap-backed elevator/finance dialogs suspend it and
+ * keep their Win3.1 insides). */
+#define MODERN_CHROME (ui_remap_active())
+static int point_in_rect(int x, int y, SDL_Rect r);
+static void draw_centered(SDL_Rect r, const char *s, SDL_Color c);
+
+/* A window body drawn inline (not via draw_win31_rect): glass in the
+ * Modern UI, rounding off under its header. Returns 0 in the classic skin,
+ * where the caller paints its own Win3.1 body. */
+static int modern_body(SDL_Rect r)
+{
+    if (!MODERN_CHROME) return 0;
+    ui_panel(r, UI_RADIUS, ui_header_above(r) ? UI_BOTTOM : UI_ALL);
+    return 1;
+}
+
 
 /* ---------- Window / display ---------- */
 #define WINDOW_W    960
@@ -370,6 +405,9 @@ typedef struct {
     int             tune_x, tune_y;   /*  -1,-1 = default placement) */
     int             map_mode;     /* 0 map / 1 eval / 2 rent / 3 hotel
                                      (EXE global 0x7840; legends 0x139..) */
+    int             in_picture;   /* render_tower is drawing the info
+                                     dialog's tenant picture offscreen —
+                                     no map-view wash there */
     int             elv_open;     /* Elevator dialog (finger/inspect a shaft) */
     int             elv_sx;       /* shaft column the dialog is bound to */
     int             elv_stype;    /* shaft ItemType */
@@ -457,6 +495,9 @@ typedef struct {
     
     /* UI bitmaps from EXE */
     SDL_Texture    *ui_items;    /* Toolbox item icons: 32 icons × 32px each, 3 rows (normal+pressed) */
+    SDL_Texture    *ui_items_modern; /* Modern UI: the same icons with the
+                                        baked-in bevel and face grey keyed
+                                        out, to float on glass tiles */
     int             ui_items_w, ui_items_h;
     SDL_Texture    *ui_timebar;  /* Info bar background (431×41) */
     int             ui_timebar_w, ui_timebar_h;
@@ -465,6 +506,7 @@ typedef struct {
     SDL_Texture    *ui_speed;    /* Speed buttons (4 states, normal + pressed) */
     int             ui_speed_w, ui_speed_h;
     SDL_Texture    *ui_tools;    /* Tool buttons (bulldozer/finger/inspector) */
+    SDL_Texture    *ui_tools_modern; /* ...keyed like ui_items_modern */
     int             ui_tools_w, ui_tools_h;
     SDL_Texture    *ui_map;      /* Map background (200×288) */
     int             ui_map_w, ui_map_h;
@@ -497,6 +539,11 @@ typedef struct {
     GameSpeed       resume_speed;
     uint8_t         anim_people, anim_effects;
     uint8_t         snd_elev, snd_bg, snd_events;
+    /* Port addition (2026-10-31): Options -> Modern UI swaps the
+     * Win3.1 chrome for the dark-glass skin (ui_skin.c). Geometry and
+     * hit-tests are shared; only the paint differs. --ui=modern /
+     * CT_UI=modern at launch; the web shell remembers it. */
+    uint8_t         ui_modern;
 
     /* SmoothScroll (CameraT 1080): minimap click-nav animates the camera
      * to the target instead of jumping (pass-3 trace: map click-nav =
@@ -665,6 +712,10 @@ typedef struct {
 #define ACT_ZOOM_RESET    34
 #define ACT_SPEED_FASTMODE 35  /* Speed menu: uncapped (the EXE's Fast Mode) */
 #define ACT_WIN_SPEED     36   /* Windows menu (port addition): Speed window */
+#define ACT_EVAL_VIEW     37   /* View menu (port addition, 2026-10-31): the
+                                  Eval map view without the map window */
+#define ACT_UI_MODERN     38   /* Options menu (port addition, 2026-10-31):
+                                  the dark-glass skin (ui_skin.c) */
 #define ACT_MASS_PRICING  29   /* Port tool (Jonah 2026-08-12): bulk rent-
                                   class changes; no EXE counterpart */
 
@@ -734,6 +785,7 @@ static const MenuItem menu_view[] = {
     { "Financial Statement\tF7", ITEM_NONE, ACT_FINANCE },
     { "Analytics Graphs\tF3",    ITEM_NONE, ACT_STATS },
     { "Tuning / Modding\tF4",    ITEM_NONE, ACT_TUNING },
+    { "Eval Overlay",            ITEM_NONE, ACT_EVAL_VIEW },
     { NULL, ITEM_NONE, ACT_NONE },
     { "Debug Labels\t`",   ITEM_NONE,  ACT_DEBUG_TOGGLE },
     { "Screenshot\tF12",   ITEM_NONE,  ACT_SCREENSHOT },
@@ -744,7 +796,7 @@ static const MenuItem menu_view[] = {
     { "Zoom Out\t[",       ITEM_NONE,  ACT_ZOOM_OUT },
     { "Actual Size\tZ",    ITEM_NONE,  ACT_ZOOM_RESET },
 };
-#define MENU_VIEW_COUNT 12
+#define MENU_VIEW_COUNT 13
 
 /* Game menu — save/load, mode (radio), quit. Every keyboard command has a
  * menu home (VNC clients often can't send function keys). */
@@ -777,8 +829,10 @@ static const MenuItem menu_options[] = {
     { "Sound: Events",     ITEM_NONE, ACT_SND_EVENTS },
     { NULL, ITEM_NONE, ACT_NONE },
     { "Mass Pricing...",   ITEM_NONE, ACT_MASS_PRICING },
+    { NULL, ITEM_NONE, ACT_NONE },
+    { "Modern UI",         ITEM_NONE, ACT_UI_MODERN },
 };
-#define MENU_OPTIONS_COUNT 10
+#define MENU_OPTIONS_COUNT 12
 
 /* Windows menu — show/hide the floating windows (menu ids 40014-40016).
  * Find Person... / Find Tenant... (40019/40020) land here once traced. */
@@ -2204,6 +2258,29 @@ static void render_tower(void)
      * through an office covers the workers, never the reverse. */
     render_occupants();
 
+    /* ====== PASS 2.2: Map-view wash (port addition, 2026-10-31) ======
+     * With the map window on Eval / Rent / Hotel, wash each room in the
+     * colour the minimap paints it (overlay.c) — BrandyTower's evaluation
+     * overlay. After the occupants so the people tint with their room,
+     * before the shafts and stairs so transport stays readable. Not in
+     * the info dialog's picture, which shows the room as it looks. */
+    if (game.map_mode != MAP_VIEW_PLAIN && !game.in_picture) {
+        SDL_SetRenderDrawBlendMode(game.renderer, SDL_BLENDMODE_BLEND);
+        for (int ti = 0; ti < game.tower.tenant_count; ti++) {
+            const Tenant *t = &game.tower.tenants[ti];
+            uint8_t rgb[3];
+            if (t->floor > top_floor ||
+                t->floor + t->height - 1 < bot_floor) continue;
+            if (!overlay_world_color(t, game.map_mode, rgb)) continue;
+            int tx, ty;
+            grid_to_screen(t->floor + t->height - 1, t->x, &tx, &ty);
+            SDL_Rect wash = { tx, ty, t->width * CELL_W, t->height * CELL_H };
+            SDL_SetRenderDrawColor(game.renderer, rgb[0], rgb[1], rgb[2], 140);
+            SDL_RenderFillRect(game.renderer, &wash);
+        }
+        SDL_SetRenderDrawBlendMode(game.renderer, SDL_BLENDMODE_NONE);
+    }
+
     /* ====== PASS 2.3: Decorative overlays (awning, fire escape) ======
      * All of OverlayT (seg_11c0) anchors to the FLOOR MAP's per-floor
      * extents — transports live in separate file blocks and do not
@@ -2580,10 +2657,12 @@ static void render_stats_window(void)
 
     draw_win31_titlebar(wx, wy, W, "Analytics");
     SDL_Rect body = { wx, wy + WIN_TITLEBAR_H, W, H };
-    SDL_SetRenderDrawColor(game.renderer, 192, 192, 192, 255);
-    SDL_RenderFillRect(game.renderer, &body);
-    SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
-    SDL_RenderDrawRect(game.renderer, &body);
+    if (!modern_body(body)) {
+        SDL_SetRenderDrawColor(game.renderer, 192, 192, 192, 255);
+        SDL_RenderFillRect(game.renderer, &body);
+        SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
+        SDL_RenderDrawRect(game.renderer, &body);
+    }
 
     StatsHistory *h = &game.sim.stats;
     int n = h->count > 120 ? 120 : h->count;
@@ -2822,10 +2901,12 @@ static void render_masspricing_window(void)
 
     draw_win31_titlebar(wx, wy, MP_W, "Mass Pricing (port tool)");
     SDL_Rect body = { wx, wy + WIN_TITLEBAR_H, MP_W, body_h };
-    SDL_SetRenderDrawColor(game.renderer, 192, 192, 192, 255);
-    SDL_RenderFillRect(game.renderer, &body);
-    SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
-    SDL_RenderDrawRect(game.renderer, &body);
+    if (!modern_body(body)) {
+        SDL_SetRenderDrawColor(game.renderer, 192, 192, 192, 255);
+        SDL_RenderFillRect(game.renderer, &body);
+        SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
+        SDL_RenderDrawRect(game.renderer, &body);
+    }
 
     int top = wy + WIN_TITLEBAR_H;
     stats_label(wx + 8, top + 7, "Apply to:", (SDL_Color){ 0, 0, 0, 255 });
@@ -2889,10 +2970,12 @@ static void render_tuning_window(void)
 
     draw_win31_titlebar(wx, wy, TUNE_W, "Tuning (EXE master values)");
     SDL_Rect body = { wx, wy + WIN_TITLEBAR_H, TUNE_W, body_h };
-    SDL_SetRenderDrawColor(game.renderer, 192, 192, 192, 255);
-    SDL_RenderFillRect(game.renderer, &body);
-    SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
-    SDL_RenderDrawRect(game.renderer, &body);
+    if (!modern_body(body)) {
+        SDL_SetRenderDrawColor(game.renderer, 192, 192, 192, 255);
+        SDL_RenderFillRect(game.renderer, &body);
+        SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
+        SDL_RenderDrawRect(game.renderer, &body);
+    }
 
     stats_label(wx + 8, wy + WIN_TITLEBAR_H + 4,
                 "Live values - defaults from SIMTOWER.EXE",
@@ -4653,6 +4736,26 @@ static void add_event_message(const char *msg)
 /* Draw a Win3.1 style title bar (navy blue with white text, for window dragging) */
 static void draw_win31_titlebar(int x, int y, int w, const char *title)
 {
+    if (game.ui_modern) {    /* glass header; the body below rounds off */
+        SDL_Rect h = { x, y, w, WIN_TITLEBAR_H };
+        ui_header_note(h);
+        ui_shadow(h, UI_RADIUS);
+        ui_fill_round(h, UI_RADIUS, UI_TOP, UI.header);
+        ui_stroke_round(h, UI_RADIUS, UI_TOP, UI.border);
+        if (game.font_small && title) {
+            SDL_Surface *ts = TTF_RenderUTF8_Blended(game.font_small, title,
+                                                     UI.text);
+            if (ts) {
+                SDL_Texture *tt = SDL_CreateTextureFromSurface(game.renderer, ts);
+                SDL_Rect dst = { x + 6, y + (WIN_TITLEBAR_H - ts->h) / 2,
+                                 ts->w, ts->h };
+                SDL_RenderCopy(game.renderer, tt, NULL, &dst);
+                SDL_DestroyTexture(tt);
+                SDL_FreeSurface(ts);
+            }
+        }
+        return;
+    }
     /* Navy blue background */
     SDL_SetRenderDrawColor(game.renderer, 0, 0, 128, 255);
     SDL_Rect bg = { x, y, w, WIN_TITLEBAR_H };
@@ -4680,8 +4783,118 @@ static void draw_win31_titlebar(int x, int y, int w, const char *title)
     }
 }
 
+/* Modern UI info bar: the same 431x41 strip and the same fields at the
+ * same spots (info_stars_rect still finds the stars), drawn as glass —
+ * a vector clock, vector stars, light type, the message in an inset. */
+static void ui_text_at(TTF_Font *f, const char *txt, SDL_Color c, int x, int y,
+                       int right_align, int max_w)
+{
+    if (!f || !txt || !txt[0]) return;
+    SDL_Surface *ts = TTF_RenderUTF8_Blended(f, txt, c);
+    if (!ts) return;
+    SDL_Texture *tt = SDL_CreateTextureFromSurface(game.renderer, ts);
+    int dw = max_w > 0 && ts->w > max_w ? max_w : ts->w;
+    SDL_Rect src = { 0, 0, dw, ts->h };
+    SDL_Rect dst = { right_align ? x - dw : x, y, dw, ts->h };
+    SDL_RenderCopy(game.renderer, tt, &src, &dst);
+    SDL_DestroyTexture(tt);
+    SDL_FreeSurface(ts);
+}
+
+static void render_info_window_modern(void)
+{
+    int wx = game.info_x, wy = game.info_y;
+    draw_win31_titlebar(wx, wy, INFO_BAR_W, "Tower Info");
+    wy += WIN_TITLEBAR_H;
+    draw_win31_rect(wx, wy, INFO_BAR_W, INFO_BAR_H, 1);   /* glass body */
+
+    /* Clock: a dial with a light hour hand and an accent minute hand. */
+    int cx = wx + 6 + CLOCK_R, cy = wy + INFO_BAR_H / 2;
+    ui_fill_round((SDL_Rect){ cx - CLOCK_R, cy - CLOCK_R, 2 * CLOCK_R + 1,
+                              2 * CLOCK_R + 1 }, CLOCK_R + 1, UI_ALL, UI.field);
+    ui_stroke_round((SDL_Rect){ cx - CLOCK_R, cy - CLOCK_R, 2 * CLOCK_R + 1,
+                                2 * CLOCK_R + 1 }, CLOCK_R + 1, UI_ALL, UI.border);
+    SDL_SetRenderDrawBlendMode(game.renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(game.renderer, 255, 255, 255, 70);
+    for (int h = 0; h < 12; h += 3) {
+        double a = (h * 30 - 90) * M_PI / 180.0;
+        SDL_RenderDrawLine(game.renderer,
+                           cx + (int)lround((CLOCK_R - 4) * cos(a)),
+                           cy + (int)lround((CLOCK_R - 4) * sin(a)),
+                           cx + (int)lround((CLOCK_R - 2) * cos(a)),
+                           cy + (int)lround((CLOCK_R - 2) * sin(a)));
+    }
+    SDL_SetRenderDrawBlendMode(game.renderer, SDL_BLENDMODE_NONE);
+    {
+        double ha = ((game.sim.hour % 12) * 30 + game.sim.minute * 0.5 - 90)
+                    * M_PI / 180.0;
+        double ma = (game.sim.minute * 6 - 90) * M_PI / 180.0;
+        int hx = cx + (int)lround(CLOCK_R * 0.5 * cos(ha));
+        int hy = cy + (int)lround(CLOCK_R * 0.5 * sin(ha));
+        int mx = cx + (int)lround(CLOCK_R * 0.78 * cos(ma));
+        int my = cy + (int)lround(CLOCK_R * 0.78 * sin(ma));
+        SDL_SetRenderDrawColor(game.renderer, UI.text.r, UI.text.g, UI.text.b, 255);
+        SDL_RenderDrawLine(game.renderer, cx, cy, hx, hy);
+        SDL_RenderDrawLine(game.renderer, cx + 1, cy, hx + 1, hy);
+        SDL_SetRenderDrawColor(game.renderer, UI.accent.r, UI.accent.g,
+                               UI.accent.b, 255);
+        SDL_RenderDrawLine(game.renderer, cx, cy, mx, my);
+        ui_fill_round((SDL_Rect){ cx - 1, cy - 1, 3, 3 }, 1, UI_ALL, UI.accent);
+    }
+
+    /* Stars, in info_stars_rect's cells (21px pitch from x+42). */
+    int star_x = wx + 42;
+    if (game.tower.star_rating >= 6) {
+        ui_text_at(game.font, "T O W E R", UI.gold, star_x + 4, wy + 3, 0, 0);
+    } else {
+        for (int i = 0; i < 5; i++)
+            ui_star(star_x + i * 21 + 10, wy + 12, 9, i < game.tower.star_rating);
+    }
+
+    /* Date, funds, population — same fields as the faithful bar. */
+    TTF_Font *finfo = game.font_info ? game.font_info : game.font_small;
+    {
+        static const char *wd_names[] = { "1st WD", "2nd WD", "WE" };
+        const char *wd = wd_names[((game.tower.day % 3) + 3) % 3];
+        int q = (game.tower.day / 3) % 4 + 1;
+        int year = game.tower.day / 12 + 1;
+        int ylast = year % 10, yten = year % 100;
+        const char *ysuf = (yten >= 11 && yten <= 13) ? "th"
+                         : ylast == 1 ? "st" : ylast == 2 ? "nd"
+                         : ylast == 3 ? "rd" : "th";
+        char date_buf[64];
+        snprintf(date_buf, sizeof date_buf, "%s \xc2\xb7 %dQ \xc2\xb7 %d%s Year",
+                 wd, q, year, ysuf);
+        ui_text_at(finfo, date_buf, UI.text, wx + 160, wy + 4, 0, 0);
+    }
+    {
+        char money_buf[64], pop_buf[32];
+        format_money(game.tower.money, money_buf, sizeof money_buf);
+        snprintf(pop_buf, sizeof pop_buf, "%d", game.tower.population);
+        int rx = wx + INFO_BAR_W - 8, mw = 0, pw = 0;
+        if (finfo) {
+            TTF_SizeUTF8(finfo, money_buf, &mw, NULL);
+            TTF_SizeUTF8(finfo, pop_buf, &pw, NULL);
+        }
+        int lx = rx - (mw > pw ? mw : pw) - 6;    /* labels hug the values */
+        ui_text_at(game.font_small, "Funds", UI.text_dim, lx, wy + 6, 1, 0);
+        ui_text_at(game.font_small, "Pop", UI.text_dim, lx, wy + 23, 1, 0);
+        ui_text_at(finfo, money_buf, game.tower.money < 0 ? UI.bad : UI.text,
+                   rx, wy + 4, 1, 0);
+        ui_text_at(finfo, pop_buf, UI.text, rx, wy + 21, 1, 0);
+    }
+    if (event_msg_total > 0) {
+        SDL_Rect well = { wx + 40, wy + 23, 262, 15 };
+        ui_fill_round(well, 7, UI_ALL, UI.field);
+        int idx = (event_msg_head - 1 + EVENT_MSG_COUNT) % EVENT_MSG_COUNT;
+        ui_text_at(game.font_small, event_messages[idx], UI.text_dim,
+                   well.x + 7, well.y + 1, 0, well.w - 12);
+    }
+}
+
 static void render_info_window(void)
 {
+    if (MODERN_CHROME) { render_info_window_modern(); return; }
     /* Info bar: horizontal strip (like original time.rml).
      * Layout: [clock 29×29] [star rating] [date info] [message] [funds/pop right-aligned] */
     int wx = game.info_x;
@@ -4851,6 +5064,84 @@ static void render_info_window(void)
 /* Shows the entire tower in a tiny overview with colored dots for tenants.
  * Positioned at TOP LEFT (like original map.rml: left:0, top:0). */
 
+/* Modern UI: the map window's legend, view tabs and viewport frame, drawn
+ * over the same rects the faithful bitmaps use (minimap_click hit-tests
+ * them unchanged). Legend entries name the same verdicts as the EXE's
+ * legend bitmaps 0x139-0x13B, in overlay.c's colours. */
+static void render_minimap_modern_overlays(int map_x, int map_y, int map_w,
+                                           int map_h, float ground_line,
+                                           float pf)
+{
+    TTF_Font *f = game.font_small;
+    if (game.map_mode > 0 && f) {
+        static const struct { const char *label; uint8_t r, g, b; } legend[4][4] = {
+            { { 0 } },
+            { { "Excellent", 0, 255, 255 }, { "Good", 204, 204, 0 },
+              { "Terrible", 230, 0, 0 }, { 0 } },
+            { { "High", 230, 0, 0 }, { "Avg", 204, 204, 0 },
+              { "Low", 0, 255, 0 }, { "V.Low", 0, 255, 255 } },
+            { { "Dirty rooms", 230, 0, 0 }, { 0 } },
+        };
+        SDL_Rect strip = { map_x + 3, map_y + map_h - 19, map_w - 6, 16 };
+        ui_fill_round(strip, 8, UI_ALL, (SDL_Color){ 14, 17, 24, 210 });
+        int n = 0, total = 0, widths[4];
+        for (; n < 4 && legend[game.map_mode][n].label; n++) {
+            int tw = 0;
+            TTF_SizeUTF8(f, legend[game.map_mode][n].label, &tw, NULL);
+            widths[n] = tw + 12;
+            total += widths[n];
+        }
+        int x = strip.x + (strip.w - total) / 2;
+        for (int i = 0; i < n; i++) {
+            SDL_Color dot = { legend[game.map_mode][i].r,
+                              legend[game.map_mode][i].g,
+                              legend[game.map_mode][i].b, 255 };
+            ui_fill_round((SDL_Rect){ x, strip.y + 5, 7, 7 }, 3, UI_ALL, dot);
+            ui_text_at(f, legend[game.map_mode][i].label, UI.text, x + 9,
+                       strip.y + (strip.h - TTF_FontHeight(f)) / 2, 0, 0);
+            x += widths[i];
+        }
+    }
+
+    /* View tabs: a segmented control in the tab strip's rect. */
+    {
+        static const char *labels[4] = { "Map", "Eval", "Rent", "Hotel" };
+        int by = map_y + map_h + 2, bw = map_w / 4;
+        ui_fill_round((SDL_Rect){ map_x, by, map_w, MAP_TAB_H }, 6, UI_ALL,
+                      UI.field);
+        for (int m = 0; m < 4; m++) {
+            int locked = (m == 3 && game.tower.star_rating < 2 &&
+                          game.sim.mode != MODE_SANDBOX);
+            SDL_Rect seg = { map_x + m * bw + 1, by + 1, bw - 2, MAP_TAB_H - 2 };
+            if (game.map_mode == m)
+                ui_button(seg, UI_BTN_ON);
+            else if (point_in_rect(game.mouse_x, game.mouse_y, seg) && !locked)
+                ui_fill_round(seg, 5, UI_ALL, (SDL_Color){ 255, 255, 255, 20 });
+            draw_centered(seg, labels[m], locked ? UI.text_off
+                                       : game.map_mode == m ? UI.text
+                                       : UI.text_dim);
+        }
+    }
+
+    /* Where the main view is looking. */
+    {
+        int cam_floor_top, cam_floor_bot, cam_xl, cam_xr;
+        mouse_to_grid(0, HUD_HEIGHT + MENU_BAR_H, &cam_floor_top, &cam_xl);
+        mouse_to_grid(game.screen_w, game.screen_h, &cam_floor_bot, &cam_xr);
+        int vt = (int)(ground_line - (cam_floor_top + 1) * pf);
+        int vb = (int)(ground_line - cam_floor_bot * pf);
+        int vl = map_x + (cam_xl * map_w / TOWER_WIDTH);
+        int vr = map_x + (cam_xr * map_w / TOWER_WIDTH);
+        if (vt < map_y) vt = map_y;
+        if (vb > map_y + map_h) vb = map_y + map_h;
+        if (vl < map_x) vl = map_x;
+        if (vr > map_x + map_w) vr = map_x + map_w;
+        SDL_Rect vp = { vl, vt, vr - vl, vb - vt };
+        ui_fill_round(vp, 3, UI_ALL, (SDL_Color){ 255, 255, 255, 28 });
+        ui_stroke_round(vp, 3, UI_ALL, (SDL_Color){ 255, 255, 255, 220 });
+    }
+}
+
 static void render_minimap(void)
 {
     int wx = game.map_x;
@@ -4877,6 +5168,10 @@ static void render_minimap(void)
     int map_y = wy + 4;
     int map_w = MAP_WIN_W - 8;
     int map_h = MAP_WIN_H - WIN_TITLEBAR_H - 26;
+
+    /* The picture keeps its true colours under the Modern UI remap. */
+    int modern = MODERN_CHROME;
+    if (modern) ui_remap_suspend();
 
     /* Map background — use original bitmap 0x8160 (200×288) if available.
      * Top 264px = sky, bottom 24px = ground strip (from OpenSkyscraper).
@@ -5005,40 +5300,14 @@ static void render_minimap(void)
             else if (t->state == TENANT_CONSTRUCTION) { r = 200; g = 180; b = 0; }
         } else if (is_shell) {
             r = 204; g = 204; b = 204;     /* shell only in overlay modes */
-        } else if (game.map_mode == 1) {
-            /* Eval = the JUDGE'S verdict byte, exactly like the EXE
-             * (FUN_11d0_0363 switches on +0x15): 0 red / 1 yellow / 2-3
-             * cyan / 0xFF or never-judged = NO tint. The old live-stress
-             * fallback tiers were invented (legacy-stress referee
-             * 2026-08-02). ABANDONED keeps a dim red as the port's
-             * rescue-target readability aid. */
-            /* Exact overlay RGBs from the 11d0:0363 color tables
-             * (referee 2026-08-08): RED(230,0,0) YELLOW(204,204,0)
-             * CYAN(0,255,255); skipped statuses show the silhouette.
-             * ABANDONED dim red stays as the port's rescue-target
-             * readability aid (documented divergence). */
-            if (t->state == TENANT_EMPTY || t->state == TENANT_CONSTRUCTION)
-                { r = 204; g = 204; b = 204; }
-            else if (t->state == TENANT_ABANDONED) { r = 100; g = 30; b = 30; }
-            else if (t->demand_category == 0)      { r = 230; g = 0; b = 0; }
-            else if (t->demand_category == 1) { r = 204; g = 204; b = 0; }
-            else if (t->demand_category == 2 || t->demand_category == 3)
-                { r = 0; g = 255; b = 255; }
-            else { r = 204; g = 204; b = 204; }  /* 0xFF / unjudged: skip */
-        } else if (game.map_mode == 2) {
-            switch (t->rent_class) {             /* mode-2 table: 0..3, 4 skip */
-            case 0:  r = 230; g = 0;   b = 0;   break;   /* High */
-            default: r = 204; g = 204; b = 0;   break;   /* Average */
-            case 2:  r = 0;   g = 255; b = 0;   break;   /* Low */
-            case 3:  r = 0;   g = 255; b = 255; break;   /* Very Low */
-            }
-        } else { /* mode 3: hotel rooms with status >= dirty band -> pure
-                  * RED, everything else skipped (11d0 mode-3 rule: byte
-                  * +0xB >= 0x28 covers dirty AND infested; the old amber
-                  * split was a port invention). */
-            if (item_is_hotel_room(t->type) &&
-                (t->condition == ROOM_DIRTY || t->condition == ROOM_INFESTED))
-                { r = 230; g = 0; b = 0; }
+        } else {
+            /* Eval / Rent / Hotel: the EXE's per-view colour tables
+             * (seg59 GetTenantOverlayColor, 11d0:0363), shared with the
+             * main view's wash — see overlay.c for the referee notes.
+             * Skipped statuses show the silhouette. */
+            uint8_t rgb[3];
+            if (overlay_tenant_color(t, game.map_mode, rgb))
+                { r = rgb[0]; g = rgb[1]; b = rgb[2]; }
             else { r = 204; g = 204; b = 204; }
         }
 
@@ -5091,6 +5360,13 @@ static void render_minimap(void)
             SDL_Rect dot = { sx - 1, sy - 1, 3, 3 };
             SDL_RenderFillRect(game.renderer, &dot);
         }
+    }
+
+    if (modern) {
+        ui_remap_resume();
+        render_minimap_modern_overlays(map_x, map_y, map_w, map_h,
+                                       ground_line, pf);
+        return;
     }
 
     /* Legend strip (the EXE blits bitmap 0x138+mode over the map): a
@@ -5351,9 +5627,106 @@ static void tool_sub_rect(int i, int j, int *bx, int *by)
     *by = gy + (j + 1) * (TOOL_BTN_SIZE + TOOL_BTN_PAD);
 }
 
+/* Modern UI: a copy of the toolbox icon strip (ARGB, 32px cells) with each
+ * cell's baked-in Win3.1 bevel (outer 2px) and the button-face grey around
+ * the picture made transparent, so the art floats on a glass tile. The
+ * face colour is whatever fills the most of the ring just inside the bevel;
+ * it is cleared by flood fill from that ring, so the same grey INSIDE a
+ * picture survives. Dark line art is inked light for the dark tile. */
+static SDL_Texture *build_modern_icons(SDL_Surface *src, int cell)
+{
+    SDL_Surface *s = SDL_ConvertSurfaceFormat(src, SDL_PIXELFORMAT_ARGB8888, 0);
+    if (!s) return NULL;
+    SDL_LockSurface(s);
+    uint32_t *px = s->pixels;
+    int pitch = s->pitch / 4, cells_x = s->w / cell, cells_y = s->h / cell;
+    if (cell > 32) { SDL_UnlockSurface(s); SDL_FreeSurface(s); return NULL; }
+    enum { RING = 2 };
+    /* Face colour: the commonest pixel on the RING-inset ring. */
+    uint32_t cand[8] = {0}; int cnt[8] = {0}, nc = 0;
+    for (int cy = 0; cy < cells_y; cy++)
+    for (int cx = 0; cx < cells_x; cx++)
+    for (int k = RING; k < cell - RING; k++) {
+        int pts[4][2] = { {k, RING}, {k, cell - 1 - RING}, {RING, k},
+                           {cell - 1 - RING, k} };
+        for (int q = 0; q < 4; q++) {
+            uint32_t c = px[(cy * cell + pts[q][1]) * pitch + cx * cell + pts[q][0]]
+                         | 0xFF000000u;
+            int f = -1;
+            for (int i = 0; i < nc; i++) if (cand[i] == c) { f = i; break; }
+            if (f < 0 && nc < 8) { cand[nc] = c; cnt[nc] = 0; f = nc++; }
+            if (f >= 0) cnt[f]++;
+        }
+    }
+    uint32_t face = 0;
+    for (int i = 0, best = -1; i < nc; i++)
+        if (cnt[i] > best) { best = cnt[i]; face = cand[i]; }
+    static int stack[32 * 32];
+    static uint8_t seen[32 * 32];
+    for (int cy = 0; cy < cells_y; cy++)
+    for (int cx = 0; cx < cells_x; cx++) {
+        uint32_t *cp = px + cy * cell * pitch + cx * cell;
+        memset(seen, 0, sizeof seen);
+        int sp = 0;
+        int e = cell - 1 - RING;
+        for (int y = 0; y < cell; y++)
+            for (int x = 0; x < cell; x++) {
+                if (x < RING || y < RING || x > e || y > e) {
+                    cp[y * pitch + x] = 0;            /* bevel: gone */
+                    seen[y * 32 + x] = 1;
+                } else if ((x == RING || y == RING || x == e || y == e) &&
+                           (cp[y * pitch + x] | 0xFF000000u) == face) {
+                    seen[y * 32 + x] = 1;
+                    stack[sp++] = y * 32 + x;
+                }
+            }
+        while (sp > 0) {
+            int p = stack[--sp], x = p % 32, y = p / 32;
+            cp[y * pitch + x] = 0;
+            int nb[4][2] = { {x + 1, y}, {x - 1, y}, {x, y + 1}, {x, y - 1} };
+            for (int q = 0; q < 4; q++) {
+                int nx = nb[q][0], ny = nb[q][1];
+                if (nx < 0 || ny < 0 || nx >= cell || ny >= cell) continue;
+                if (seen[ny * 32 + nx]) continue;
+                seen[ny * 32 + nx] = 1;
+                if ((cp[ny * pitch + nx] | 0xFF000000u) == face)
+                    stack[sp++] = ny * 32 + nx;
+            }
+        }
+    }
+    /* Dark line art (the Lb / Flr / Shop lettering and stair strokes are
+     * #4C4C4C; outlines are black) would vanish on a dark tile: any opaque
+     * near-neutral dark grey is inked light instead. */
+    for (int y = 0; y < s->h; y++)
+        for (int x = 0; x < s->w; x++) {
+            uint32_t p = px[y * pitch + x];
+            int r = (p >> 16) & 0xFF, g = (p >> 8) & 0xFF, b = p & 0xFF;
+            int hi = r > g ? (r > b ? r : b) : (g > b ? g : b);
+            int lo = r < g ? (r < b ? r : b) : (g < b ? g : b);
+            if ((p >> 24) == 0xFF && hi < 96 && hi - lo < 16)
+                px[y * pitch + x] = 0xFFE1E6EEu;
+        }
+    SDL_UnlockSurface(s);
+    SDL_Texture *t = SDL_CreateTextureFromSurface(game.renderer, s);
+    if (t) SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+    SDL_FreeSurface(s);
+    return t;
+}
+
 /* Draw one 32×32 item icon (from ui_items) with a raised/sunken 3D border. */
 static void draw_tool_icon(int bx, int by, int icon_idx, int selected)
 {
+    if (MODERN_CHROME && game.ui_items_modern) {   /* art on a glass tile */
+        SDL_Rect tile = { bx + 1, by + 1, TOOL_BTN_SIZE - 2, TOOL_BTN_SIZE - 2 };
+        int hot = point_in_rect(game.mouse_x, game.mouse_y, tile);
+        ui_button(tile, selected ? UI_BTN_ON : hot ? UI_BTN_HOT : UI_BTN_NORMAL);
+        if (icon_idx >= 0) {
+            SDL_Rect src = { icon_idx * 32 + 2, 2, 28, 28 };
+            SDL_Rect dst = { bx + 2, by + 2, 28, 28 };
+            SDL_RenderCopy(game.renderer, game.ui_items_modern, &src, &dst);
+        }
+        return;
+    }
     if (!selected) {
         SDL_SetRenderDrawColor(game.renderer, 255, 255, 255, 255);
         SDL_RenderDrawLine(game.renderer, bx, by, bx + TOOL_BTN_SIZE - 1, by);
@@ -5386,6 +5759,11 @@ static void draw_pulldown_marker(int bx, int by)
     int y1 = by + TOOL_BTN_SIZE - 2;   /* corner: bottom edge */
     int T  = 6;
     SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
+    if (MODERN_CHROME) {          /* a small accent corner */
+        T = 4; x1 -= 2; y1 -= 2;
+        SDL_SetRenderDrawColor(game.renderer, UI.accent.r, UI.accent.g,
+                               UI.accent.b, 255);
+    }
     /* Fill rows from the bottom up; each row up shrinks from the left, leaving
      * a hypotenuse from (x1-T, y1) to (x1, y1-T) and a solid bottom-right. */
     for (int k = 0; k <= T; k++) {
@@ -5410,18 +5788,28 @@ static void render_tool_popup(void)
     int x0, y0, xn, yn;
     tool_sub_rect(i, 0, &x0, &y0);
     tool_sub_rect(i, nvis - 1, &xn, &yn);
+    if (MODERN_CHROME) {
+        SDL_Rect pop = { x0 - 4, y0 - 4, TOOL_BTN_SIZE + 8,
+                         (yn - y0) + TOOL_BTN_SIZE + 8 };
+        ui_shadow(pop, UI_RADIUS);
+        ui_fill_round(pop, UI_RADIUS, UI_ALL, (SDL_Color){ 18, 22, 30, 244 });
+        ui_stroke_round(pop, UI_RADIUS, UI_ALL, UI.border);
+    } else {
     SDL_SetRenderDrawColor(game.renderer, 64, 64, 64, 255);
     SDL_Rect shadow = { x0 + 2, y0 + 2, TOOL_BTN_SIZE + 2, (yn - y0) + TOOL_BTN_SIZE + 2 };
     SDL_RenderFillRect(game.renderer, &shadow);
+    }
 
     for (int vj = 0; vj < nvis; vj++) {
         int j = tool_sub_visible_index(i, vj);
         if (j < 0) continue;
         int bx, by;
         tool_sub_rect(i, vj, &bx, &by);
+        if (!MODERN_CHROME) {
         SDL_SetRenderDrawColor(game.renderer, 192, 192, 192, 255);
         SDL_Rect bg = { bx - 1, by - 1, TOOL_BTN_SIZE + 2, TOOL_BTN_SIZE + 2 };
         SDL_RenderFillRect(game.renderer, &bg);
+        }
         draw_tool_icon(bx, by, g->sub_icon[j], g->sub[j] == game.build_type);
     }
 }
@@ -5492,12 +5880,12 @@ static void render_speed_window(void)
         SDL_Rect r = speed_win_button(i);
         int on = ((int)game.sim.speed == i);
         draw_win31_rect(r.x, r.y, r.w, r.h, !on);
-        if (on) {   /* pressed: sunken and a shade darker */
+        if (on && !MODERN_CHROME) {   /* pressed: sunken and a shade darker */
             SDL_SetRenderDrawColor(game.renderer, 160, 160, 160, 255);
             SDL_Rect in = { r.x + 1, r.y + 1, r.w - 2, r.h - 2 };
             SDL_RenderFillRect(game.renderer, &in);
         }
-        int ox = on ? 1 : 0;            /* pressed content shifts 1px */
+        int ox = on && !MODERN_CHROME ? 1 : 0; /* pressed content shifts 1px */
         int cx = r.x + r.w / 2 + ox, cy = r.y + r.h / 2 + ox;
         SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
         if (i == SPEED_PAUSED) {
@@ -5550,7 +5938,19 @@ static void render_toolbox(void)
         int bw = SPEED_BTN_W, bh = SPEED_BTN_H;
         int sx = wx + (TOOL_WIN_W - bw) / 2;
         int playing = (game.sim.speed > 0);
-        if (game.ui_speed) {
+        if (MODERN_CHROME) {      /* a glass pill with a drawn glyph */
+            SDL_Rect b = { sx, speed_y, bw, bh };
+            ui_button(b, playing ? UI_BTN_NORMAL : UI_BTN_ACCENT);
+            SDL_SetRenderDrawColor(game.renderer, 255, 255, 255, 255);
+            int cx = sx + bw / 2, cy = speed_y + bh / 2;
+            if (playing) {
+                SDL_Rect b1 = { cx - 5, cy - 6, 3, 13 }, b2 = { cx + 2, cy - 6, 3, 13 };
+                SDL_RenderFillRect(game.renderer, &b1);
+                SDL_RenderFillRect(game.renderer, &b2);
+            } else {
+                fill_play_triangle(cx - 4, cy, 10);
+            }
+        } else if (game.ui_speed) {
             int icon_x = playing ? 64 : 0;        /* pause : play (64px cells) */
             SDL_Rect src = { icon_x, 0, 64, 32 };
             SDL_Rect dst = { sx, speed_y, bw, bh };
@@ -5572,6 +5972,16 @@ static void render_toolbox(void)
                           (t == 1 && game.finger_mode) ||
                           (t == 2 && game.inspect_mode);
             int row_y = pressed ? 21 : 0;
+            if (MODERN_CHROME && game.ui_tools_modern) {
+                SDL_Rect tile = { tx + t * 23, tools_y, 21, 21 };
+                int hot = point_in_rect(game.mouse_x, game.mouse_y, tile);
+                ui_button(tile, pressed ? UI_BTN_ON : hot ? UI_BTN_HOT
+                                                         : UI_BTN_NORMAL);
+                SDL_Rect src = { t * 21 + 2, 2, 17, 17 };
+                SDL_Rect dst = { tile.x + 2, tile.y + 2, 17, 17 };
+                SDL_RenderCopy(game.renderer, game.ui_tools_modern, &src, &dst);
+                continue;
+            }
             SDL_Rect src = { t * 21, row_y, 21, 21 };
             SDL_Rect dst = { tx + t * 23, tools_y, 21, 21 };
             SDL_RenderCopy(game.renderer, game.ui_tools, &src, &dst);
@@ -5657,6 +6067,18 @@ static void render_toolbox(void)
 /* Draw a Win3.1-style raised/sunken rectangle */
 static void draw_win31_rect(int x, int y, int w, int h, int raised)
 {
+    if (game.ui_modern) {
+        SDL_Rect r = { x, y, w, h };
+        int under_header = ui_header_above(r);
+        if (w <= 16 && h <= 14) {                 /* title-bar close box */
+            ui_fill_round(r, h / 2, UI_ALL, UI.raised_hot);
+        } else if (under_header || w * h >= 6000) {   /* a window body */
+            ui_panel(r, UI_RADIUS, under_header ? UI_BOTTOM : UI_ALL);
+        } else {
+            ui_button(r, raised ? UI_BTN_NORMAL : UI_BTN_ON);
+        }
+        return;
+    }
     uint8_t hi_r = raised ? 255 : 128, hi_g = raised ? 255 : 128, hi_b = raised ? 255 : 128;
     uint8_t lo_r = raised ? 128 : 255, lo_g = raised ? 128 : 255, lo_b = raised ? 128 : 255;
     
@@ -5700,6 +6122,15 @@ static void render_menu_bar(void)
 {
     /* Win3.1 menu bar: gray with raised border */
     int bar_y = HUD_HEIGHT;
+    if (MODERN_CHROME) {          /* a flat glass strip, hairline below */
+        ui_fill_round((SDL_Rect){ 0, bar_y, game.screen_w, MENU_BAR_H }, 0,
+                      UI_ALL, (SDL_Color){ 14, 17, 24, 228 });
+        SDL_SetRenderDrawBlendMode(game.renderer, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(game.renderer, 255, 255, 255, 30);
+        SDL_RenderDrawLine(game.renderer, 0, bar_y + MENU_BAR_H - 1,
+                           game.screen_w - 1, bar_y + MENU_BAR_H - 1);
+        SDL_SetRenderDrawBlendMode(game.renderer, SDL_BLENDMODE_NONE);
+    } else
     draw_win31_rect(0, bar_y, game.screen_w, MENU_BAR_H, 1);
     
     /* Draw top-level menu labels */
@@ -5710,7 +6141,15 @@ static void render_menu_bar(void)
         int is_active = (game.menu_open == i);
         int is_hover = (game.menu_bar_hover == i && game.menu_open < 0);
         
-        if (is_active) {
+        if (is_active && MODERN_CHROME) {
+            ui_fill_round((SDL_Rect){ cx, bar_y + 1, tw, MENU_BAR_H - 2 }, 4,
+                          UI_ALL, UI.accent_soft);
+            draw_menu_text(top_menu_label(i), cx + menu_item_pad(), bar_y + 3, 1);
+        } else if (is_hover && MODERN_CHROME) {
+            ui_fill_round((SDL_Rect){ cx, bar_y + 1, tw, MENU_BAR_H - 2 }, 4,
+                          UI_ALL, (SDL_Color){ 255, 255, 255, 24 });
+            draw_menu_text(top_menu_label(i), cx + menu_item_pad(), bar_y + 3, 0);
+        } else if (is_active) {
             /* Sunken look when menu is open */
             SDL_SetRenderDrawColor(game.renderer, WIN31_SEL_BG, 255);
             SDL_Rect sel = { cx, bar_y + 1, tw, MENU_BAR_H - 2 };
@@ -5751,6 +6190,12 @@ static void render_dropdown(void)
         drop_h += tm->items[i].label ? item_h : sep_h;
     }
     
+    if (MODERN_CHROME) {          /* rounded glass popover */
+        SDL_Rect pop = { drop_x, drop_y, drop_w, drop_h };
+        ui_shadow(pop, UI_RADIUS);
+        ui_fill_round(pop, UI_RADIUS, UI_ALL, (SDL_Color){ 18, 22, 30, 244 });
+        ui_stroke_round(pop, UI_RADIUS, UI_ALL, UI.border);
+    } else {
     /* Draw dropdown shadow */
     SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 80);
     SDL_SetRenderDrawBlendMode(game.renderer, SDL_BLENDMODE_BLEND);
@@ -5760,10 +6205,20 @@ static void render_dropdown(void)
     
     /* Draw dropdown background with Win3.1 raised border */
     draw_win31_rect(drop_x, drop_y, drop_w, drop_h, 1);
+    }
     
     /* Draw items */
     int iy = drop_y + 2;
     for (int i = 0; i < tm->count; i++) {
+        if (!tm->items[i].label && MODERN_CHROME) {
+            SDL_SetRenderDrawBlendMode(game.renderer, SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(game.renderer, 255, 255, 255, 28);
+            SDL_RenderDrawLine(game.renderer, drop_x + 8, iy + sep_h / 2,
+                               drop_x + drop_w - 9, iy + sep_h / 2);
+            SDL_SetRenderDrawBlendMode(game.renderer, SDL_BLENDMODE_NONE);
+            iy += sep_h;
+            continue;
+        }
         if (!tm->items[i].label) {
             /* Separator: thin sunken line */
             SDL_SetRenderDrawColor(game.renderer, 128, 128, 128, 255);
@@ -5778,7 +6233,10 @@ static void render_dropdown(void)
         
         int is_hover = (game.menu_hover == i);
         
-        if (is_hover) {
+        if (is_hover && MODERN_CHROME) {
+            ui_fill_round((SDL_Rect){ drop_x + 4, iy, drop_w - 8, item_h }, 5,
+                          UI_ALL, UI.accent_soft);
+        } else if (is_hover) {
             SDL_SetRenderDrawColor(game.renderer, WIN31_SEL_BG, 255);
             SDL_Rect sel = { drop_x + 2, iy, drop_w - 4, item_h };
             SDL_RenderFillRect(game.renderer, &sel);
@@ -5805,8 +6263,19 @@ static void render_dropdown(void)
         if (tm->items[i].action == ACT_SND_ELEV && game.snd_elev) checked = 1;
         if (tm->items[i].action == ACT_SND_BG && game.snd_bg) checked = 1;
         if (tm->items[i].action == ACT_SND_EVENTS && game.snd_events) checked = 1;
+        if (tm->items[i].action == ACT_EVAL_VIEW && game.map_mode == MAP_VIEW_EVAL) checked = 1;
+        if (tm->items[i].action == ACT_UI_MODERN && game.ui_modern) checked = 1;
         
-        if (checked) {
+        if (checked && MODERN_CHROME) {   /* drawn: the fonts lack ✓ */
+            int cx = drop_x + 9, cy = iy + item_h / 2;
+            SDL_SetRenderDrawColor(game.renderer, UI.accent.r, UI.accent.g,
+                                   UI.accent.b, 255);
+            for (int t = 0; t < 2; t++) {
+                SDL_RenderDrawLine(game.renderer, cx, cy + t, cx + 3, cy + 3 + t);
+                SDL_RenderDrawLine(game.renderer, cx + 3, cy + 3 + t,
+                                   cx + 9, cy - 3 + t);
+            }
+        } else if (checked) {
             draw_menu_text("\xe2\x9c\x93", drop_x + 6, iy + 2, is_hover); /* ✓ */
         }
         
@@ -6116,6 +6585,11 @@ static int point_in_rect(int x, int y, SDL_Rect r)
 static void draw_modal_button(SDL_Rect r, const char *label)
 {
     int hot = point_in_rect(game.mouse_x, game.mouse_y, r);
+    if (MODERN_CHROME) {
+        ui_button(r, hot ? UI_BTN_HOT : UI_BTN_NORMAL);
+        draw_centered(r, label, UI.text);
+        return;
+    }
     draw_win31_rect(r.x, r.y, r.w, r.h, hot ? 0 : 1);
     SDL_Color fg = { 0, 0, 0, 255 };
     int tw, th;
@@ -7318,6 +7792,7 @@ static void draw_centered(SDL_Rect r, const char *s, SDL_Color c)
 }
 static void draw_bevel(SDL_Rect r, int raised)
 {
+    if (MODERN_CHROME) return;        /* no bevels on glass */
     SDL_SetRenderDrawColor(game.renderer, raised ? 255 : 90, raised ? 255 : 90, raised ? 255 : 90, 255);
     SDL_RenderDrawLine(game.renderer, r.x, r.y, r.x + r.w - 1, r.y);
     SDL_RenderDrawLine(game.renderer, r.x, r.y, r.x, r.y + r.h - 1);
@@ -7327,6 +7802,11 @@ static void draw_bevel(SDL_Rect r, int raised)
 }
 static void draw_dlg_button(SDL_Rect r, const char *label, int enabled)
 {
+    if (MODERN_CHROME) {
+        ui_button(r, enabled ? UI_BTN_NORMAL : UI_BTN_OFF);
+        draw_centered(r, label, enabled ? UI.text : UI.text_off);
+        return;
+    }
     SDL_SetRenderDrawColor(game.renderer, 200, 200, 200, 255);
     SDL_RenderFillRect(game.renderer, &r);
     draw_bevel(r, 1);
@@ -7373,6 +7853,7 @@ static void draw_patron_bar(SDL_Rect box, int val, int max)
 #define DLG_INSET 8
 static void draw_dlg_frame(SDL_Rect r)
 {
+    if (MODERN_CHROME) { ui_panel(r, UI_RADIUS + 2, UI_ALL); return; }
     SDL_SetRenderDrawColor(game.renderer, WIN31_BG, 255);
     SDL_RenderFillRect(game.renderer, &r);
     SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
@@ -7386,6 +7867,7 @@ static void draw_dlg_frame(SDL_Rect r)
 /* Sunken white field (title boxes, value boxes, comment wells). */
 static void draw_field31(SDL_Rect r)
 {
+    if (MODERN_CHROME) { ui_field(r); return; }
     SDL_SetRenderDrawColor(game.renderer, 255, 255, 255, 255);
     SDL_RenderFillRect(game.renderer, &r);
     SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
@@ -7433,6 +7915,14 @@ static void draw_label31(SDL_Rect r, SDL_Rect field, const char *s, SDL_Color c)
 /* Win3.1 push button: black border, double bevel, default ring. */
 static void draw_btn31(SDL_Rect r, const char *label, int is_default, int enabled)
 {
+    if (MODERN_CHROME) {
+        int hot = enabled && point_in_rect(game.mouse_x, game.mouse_y, r);
+        ui_button(r, !enabled ? UI_BTN_OFF : is_default ? UI_BTN_ACCENT
+                                : hot ? UI_BTN_HOT : UI_BTN_NORMAL);
+        draw_centered(r, label, enabled ? (SDL_Color){ 255, 255, 255, 255 }
+                                        : UI.text_off);
+        return;
+    }
     SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
     if (is_default) {
         SDL_RenderDrawRect(game.renderer, &r);
@@ -7460,6 +7950,19 @@ static void draw_btn31(SDL_Rect r, const char *label, int is_default, int enable
  * lines at both thresholds' inverted positions. */
 static void draw_eval_gauge31(SDL_Rect box, int val, int t_blue, int t_yel)
 {
+    if (MODERN_CHROME) {      /* same bands and ticks, as a rounded meter */
+        int v = val < 0 ? 0 : val > 300 ? 300 : val;
+        SDL_Color c = v < t_blue ? UI.good : v < t_yel ? UI.ok : UI.bad;
+        ui_progress(box, (300 - v) * 1000 / 300, c);
+        SDL_SetRenderDrawBlendMode(game.renderer, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(game.renderer, 255, 255, 255, 90);
+        int tx1 = box.x + box.w * (300 - t_yel) / 300;
+        int tx2 = box.x + box.w * (300 - t_blue) / 300;
+        SDL_RenderDrawLine(game.renderer, tx1, box.y + 2, tx1, box.y + box.h - 3);
+        SDL_RenderDrawLine(game.renderer, tx2, box.y + 2, tx2, box.y + box.h - 3);
+        SDL_SetRenderDrawBlendMode(game.renderer, SDL_BLENDMODE_NONE);
+        return;
+    }
     draw_field31(box);
     int v = val < 0 ? 0 : val > 300 ? 300 : val;
     SDL_Color c = v < t_blue ? (SDL_Color){ 40, 80, 200, 255 }
@@ -7527,9 +8030,13 @@ static void draw_tenant_picture(const Tenant *t, SDL_Rect box)
         game.view_w = game.screen_w; game.view_h = game.screen_h;
         game.cam_fx = (float)(wx0 + game.screen_w / 2);
         game.cam_fy = (float)(wy0 + game.screen_h / 2);
+        game.in_picture = 1;
+        ui_remap_suspend();
         render_sky();
         render_tower();
         render_people();
+        ui_remap_resume();
+        game.in_picture = 0;
         game.cam_fx = sx; game.cam_fy = sy;
         game.view_w = svw; game.view_h = svh;
         SDL_SetRenderTarget(game.renderer, NULL);
@@ -8267,11 +8774,13 @@ static void render_movie_chooser(void)
     SDL_SetRenderDrawBlendMode(game.renderer, SDL_BLENDMODE_NONE);
 
     SDL_Rect d = movie_dlg_rect();
-    SDL_SetRenderDrawColor(game.renderer, 198, 198, 198, 255);
-    SDL_RenderFillRect(game.renderer, &d);
-    draw_bevel(d, 1);
-    SDL_SetRenderDrawColor(game.renderer, 90, 90, 90, 255);
-    SDL_RenderDrawRect(game.renderer, &d);
+    if (!modern_body(d)) {
+        SDL_SetRenderDrawColor(game.renderer, 198, 198, 198, 255);
+        SDL_RenderFillRect(game.renderer, &d);
+        draw_bevel(d, 1);
+        SDL_SetRenderDrawColor(game.renderer, 90, 90, 90, 255);
+        SDL_RenderDrawRect(game.renderer, &d);
+    }
     stats_label(d.x + 12, d.y + 10, "Book a new movie:", ink);
     char now[64]; snprintf(now, sizeof now, "Now: %s",
                            movie_title(t->movie_id));
@@ -8536,6 +9045,7 @@ static void render(void)
     SDL_Cursor *want = game.demolish_mode ? game.cursor_demolish : game.cursor_arrow;
     if (want && SDL_GetCursor() != want) SDL_SetCursor(want);
 
+    ui_frame_begin();
     SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
     SDL_RenderClear(game.renderer);
 
@@ -8612,12 +9122,15 @@ static void render(void)
                          (int)(game.view_h * game.zoom) };
         SDL_RenderCopy(game.renderer, game.world_tex, NULL, &dst);
     }
+    ui_chrome_begin();         /* Modern UI: the remap covers the chrome */
     render_ui();
     render_stats_window();
     render_tuning_window();
     render_masspricing_window();
+    ui_remap_suspend();        /* bitmap-backed dialogs keep their colours */
     render_elv_dialog();
     render_fin_dialog();
+    ui_remap_resume();
     render_inspect_popup();
     render_tenant_notes();    /* "why / how to fix" docked under it */
     render_person_popup();
@@ -8633,6 +9146,7 @@ static void render(void)
     render_route_confirm();    /* likewise */
     render_quit_confirm();     /* topmost — quitting outranks all */
     render_tooltip();          /* hints sit over everything they explain */
+    ui_chrome_end();
 
     SDL_RenderPresent(game.renderer);
 }
@@ -9062,6 +9576,33 @@ static int point_in_any_window(int mx, int my)
     return 0;
 }
 
+/* Switch the map view (Map/Eval/Rent/Hotel — EXE global 0x7840). The
+ * 4th view is locked until the 2nd star (pass-3 MapWndProc). Shared by
+ * the map window's tab strip and View -> Eval Overlay. */
+static void set_map_mode(int m)
+{
+    if (m < 0 || m > 3) return;
+    if (m == 3 && game.tower.star_rating < 2 && game.sim.mode != MODE_SANDBOX)
+        return;
+    /* Opening the EVAL overlay re-judges everything first, so the
+     * verdict colors are fresh (11d0:0000 lcalls JudgeAllTenants
+     * 1130:00b5 when mode==1; legacy-stress referee 2026-08-02). */
+    if (m == 1 && game.map_mode != 1)
+        game_judge_daily(&game.sim, &game.tower);
+    game.map_mode = m;
+}
+
+/* Options -> Modern UI. The web shell remembers the choice (localStorage
+ * 'ct-ui') and passes --ui=modern on the next launch. */
+static void set_ui_modern(int on)
+{
+    game.ui_modern = on ? 1 : 0;
+    ui_skin_set(game.ui_modern);
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ if (window.ctUiEvent) window.ctUiEvent($0); }, game.ui_modern);
+#endif
+}
+
 /* ---------- Minimap click helper ---------- */
 static int minimap_click(int mx, int my)
 {
@@ -9090,17 +9631,7 @@ static int minimap_click(int mx, int my)
      * 4th overlay is locked until the 2nd star, pass-3 MapWndProc). */
     if (mx >= map_x && mx < map_x + map_w &&
         my >= map_y + map_h + 2 && my < map_y + map_h + 2 + MAP_TAB_H) {
-        int m = (mx - map_x) / (map_w / 4);
-        if (m >= 0 && m <= 3 &&
-            (m < 3 || game.tower.star_rating >= 2 ||
-             game.sim.mode == MODE_SANDBOX)) {
-            /* Opening the EVAL overlay re-judges everything first, so the
-             * verdict colors are fresh (11d0:0000 lcalls JudgeAllTenants
-             * 1130:00b5 when mode==1; legacy-stress referee 2026-08-02). */
-            if (m == 1 && game.map_mode != 1)
-                game_judge_daily(&game.sim, &game.tower);
-            game.map_mode = m;
-        }
+        set_map_mode((mx - map_x) / (map_w / 4));
         return 1;
     }
     return 0;
@@ -9396,6 +9927,11 @@ static void execute_menu_item(const MenuItem *item)
     case ACT_SND_ELEV:     game.snd_elev ^= 1;   break;
     case ACT_SND_BG:       game.snd_bg ^= 1;     break;
     case ACT_SND_EVENTS:   game.snd_events ^= 1; break;
+    case ACT_EVAL_VIEW:
+        set_map_mode(game.map_mode == MAP_VIEW_EVAL ? MAP_VIEW_PLAIN
+                                                    : MAP_VIEW_EVAL);
+        break;
+    case ACT_UI_MODERN:    set_ui_modern(!game.ui_modern); break;
     case ACT_FIND_PERSON:  game.find_open = 1; game.find_sel = -1; break;
     case ACT_FIND_TENANT:  game.find_open = 2; game.find_sel = -1; break;
     case ACT_MODE_CAMPAIGN:
@@ -11088,10 +11624,17 @@ static void draw_hint_box(char in[][HINT_LEN], int nin, int x, int y,
     if (y + h > game.screen_h - 2) y = (anchor_below ? y - 28 : y) - h;
     if (x < 2) x = 2;
     if (y < 2) y = 2;
+    if (MODERN_CHROME) {
+        SDL_Rect box = { x - 1, y - 1, w + 2, h + 2 };
+        ui_shadow(box, 6);
+        ui_fill_round(box, 6, UI_ALL, (SDL_Color){ 14, 17, 24, 242 });
+        ui_stroke_round(box, 6, UI_ALL, UI.border);
+    } else {
     draw_win31_rect(x, y, w, h, 1);
     SDL_SetRenderDrawColor(game.renderer, 0, 0, 0, 255);
     SDL_Rect border = { x - 1, y - 1, w + 2, h + 2 };
     SDL_RenderDrawRect(game.renderer, &border);
+    }
     for (int i = 0; i < n; i++)
         draw_hint_text(i == 0 && game.font ? game.font : body, out[i],
                        x + 6, y + 4 + i * lh);
@@ -11314,10 +11857,11 @@ EMSCRIPTEN_KEEPALIVE const char *ct_view_state(void)
     snprintf(buf, sizeof buf,
              "{\"zoom\":%d,\"cx\":%.1f,\"cy\":%.1f,\"sw\":%d,\"sh\":%d,"
              "\"vw\":%d,\"vh\":%d,\"money\":%ld,\"pending\":%d,"
-             "\"build\":%d,\"map\":%d}",
+             "\"build\":%d,\"map\":%d,\"mode\":%d,\"ui\":%d}",
              game.zoom_idx, game.cam_fx, game.cam_fy, game.screen_w,
              game.screen_h, game.view_w, game.view_h, (long)game.tower.money,
-             game.place_pending, (int)game.build_type, game.win_map);
+             game.place_pending, (int)game.build_type, game.win_map,
+             game.map_mode, game.ui_modern);
     return buf;
 }
 
@@ -11496,6 +12040,7 @@ int main(int argc, char *argv[])
 #ifndef __EMSCRIPTEN__
     update_px_scale();   /* Retina: draw logical px at an integer scale */
 #endif
+    ui_skin_init(game.renderer);
 
     /* Replace the bare X-server root cursor with a proper arrow; the bulldozer
      * gets a crosshair. (SimTower swaps the cursor per active tool.) */
@@ -11968,6 +12513,8 @@ int main(int argc, char *argv[])
                 SDL_FreeSurface(bmp);
             }
             
+            game.ui_items_modern = build_modern_icons(items_surf, 32);
+
             /* Make gray background transparent (0x999999) */
             SDL_SetColorKey(items_surf, SDL_TRUE, SDL_MapRGB(items_surf->format, 0x99, 0x99, 0x99));
             
@@ -12063,6 +12610,7 @@ int main(int argc, char *argv[])
                     SDL_BlitSurface(bmp, NULL, tools_surf, &dst);
                     SDL_FreeSurface(bmp);
                 }
+                game.ui_tools_modern = build_modern_icons(tools_surf, 21);
                 game.ui_tools = SDL_CreateTextureFromSurface(game.renderer, tools_surf);
                 game.ui_tools_w = tools_surf->w;
                 game.ui_tools_h = tools_surf->h;
@@ -12329,6 +12877,15 @@ int main(int argc, char *argv[])
         game.cam_fx = atof(getenv("CT_CAM_X")) * CELL_W;
     if (getenv("CT_MAP_MODE"))
         game.map_mode = atoi(getenv("CT_MAP_MODE")) & 3;
+    {   /* Modern UI skin (port addition): --ui=modern / --ui=classic
+         * from the web shell, CT_UI=modern for tests. */
+        int modern = getenv("CT_UI") && !strcmp(getenv("CT_UI"), "modern");
+        for (int i = 1; i < argc; i++)
+            if (!strncmp(argv[i], "--ui=", 5))
+                modern = !strcmp(argv[i] + 5, "modern");
+        game.ui_modern = (uint8_t)modern;
+        ui_skin_set(game.ui_modern);
+    }
     if (getenv("CT_WEDDING")) {        /* demo: run the TOWER ceremony */
         game.sim.wedding.active = 1;
         game.sim.wed_phase = 2;

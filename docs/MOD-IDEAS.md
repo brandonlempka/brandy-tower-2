@@ -20,6 +20,12 @@ the faithful port stays the default; mods are opt-in flavor on top.
   every hit-test that assumes CELL_W/CELL_H; consider a global
   view-scale factor those helpers own.
 
+- **Modern UI skin** — SHIPPED 2026-10-31 (requested that day): an opt-in
+  dark-glass skin over the faithful Win3.1 chrome (Options → Modern UI;
+  `src/ui_skin.c`, README "Modern play"). Same rects and hit-tests; the
+  classic frame is untouched. Shipped with it: the main-view map-view wash
+  (Eval/Rent/Hotel tint the rooms, BrandyTower style; `src/overlay.c`).
+
 - **Finer speed control** (Jonah, 2026-07-29) — **done 2026-10-31**,
   brought over from brandytower. The original's only speed control is
   Options → Fast Mode (removes the 6ms tick throttle; menu id 40007 →

@@ -2,7 +2,7 @@
  * people/elevator pipeline.
  * Build: gcc -o /tmp/test_sim tests/test_sim.c src/tower.c src/game.c \
  *            src/people.c src/twr.c src/sound_hook.c src/touch.c \
- *            src/hints.c -Isrc -lm
+ *            src/hints.c src/overlay.c -Isrc -lm
  *        (macOS: add -include stddef.h — glibc pulls offsetof in for us) 
  * No SDL needed — pure simulation (sound_hook.c is a no-op stub here). */
 #include <stdio.h>
@@ -12,6 +12,7 @@
 #include "view.h"
 #include "touch.h"
 #include "hints.h"
+#include "overlay.h"
 
 static Tower tw;
 static GameSim sim;
@@ -3971,8 +3972,69 @@ static void test_hints(void)
     }
 }
 
+/* The map views' tint (overlay.c): the minimap keeps the EXE's exact
+ * tables; the main-view wash only covers rooms the view judges. */
+static void test_map_overlay(void)
+{
+    printf("map-view overlay:\n");
+    uint8_t c[3];
+    Tenant t;
+#define RGB_IS(R, G, B) (c[0] == (R) && c[1] == (G) && c[2] == (B))
+    memset(&t, 0, sizeof t);
+    t.type = ITEM_OFFICE; t.state = TENANT_OCCUPIED;
+    t.demand_category = 0;
+    CHECK(overlay_tenant_color(&t, MAP_VIEW_EVAL, c) && RGB_IS(230, 0, 0),
+          "eval: verdict 0 = Terrible red (11d0:0363)");
+    t.demand_category = 1;
+    CHECK(overlay_tenant_color(&t, MAP_VIEW_EVAL, c) && RGB_IS(204, 204, 0),
+          "eval: verdict 1 = Good yellow");
+    t.demand_category = 3;
+    CHECK(overlay_tenant_color(&t, MAP_VIEW_EVAL, c) && RGB_IS(0, 255, 255),
+          "eval: verdict 2-3 = Excellent cyan");
+    t.demand_category = 0xFF;
+    CHECK(!overlay_tenant_color(&t, MAP_VIEW_EVAL, c),
+          "eval: unjudged (0xFF) is not tinted");
+    t.demand_category = 1; t.state = TENANT_EMPTY;
+    CHECK(!overlay_tenant_color(&t, MAP_VIEW_EVAL, c),
+          "eval: an empty unit is not tinted");
+    t.state = TENANT_ABANDONED;
+    CHECK(overlay_tenant_color(&t, MAP_VIEW_EVAL, c) && RGB_IS(100, 30, 30),
+          "eval: abandoned keeps the port's dim red");
+
+    t.state = TENANT_OCCUPIED; t.rent_class = 0;
+    CHECK(overlay_tenant_color(&t, MAP_VIEW_RENT, c) && RGB_IS(230, 0, 0),
+          "rent: High = red");
+    t.rent_class = 2;
+    CHECK(overlay_tenant_color(&t, MAP_VIEW_RENT, c) && RGB_IS(0, 255, 0),
+          "rent: Low = green");
+    t.type = ITEM_LOBBY; t.rent_class = 1;
+    CHECK(overlay_tenant_color(&t, MAP_VIEW_RENT, c) && RGB_IS(204, 204, 0),
+          "rent: the minimap's faithful Average fallback covers the lobby");
+    CHECK(!overlay_world_color(&t, MAP_VIEW_RENT, c),
+          "rent: ...but the main-view wash skips rooms that pay no rent");
+
+    t.type = ITEM_HOTEL_SINGLE; t.condition = ROOM_DIRTY;
+    CHECK(overlay_tenant_color(&t, MAP_VIEW_HOTEL, c) && RGB_IS(230, 0, 0),
+          "hotel: dirty room = red");
+    t.condition = ROOM_CLEAN;
+    CHECK(!overlay_tenant_color(&t, MAP_VIEW_HOTEL, c),
+          "hotel: clean room not tinted");
+
+    t.type = ITEM_OFFICE; t.demand_category = 0;
+    CHECK(overlay_world_color(&t, MAP_VIEW_EVAL, c) && c[0] > c[1] && c[0] > c[2],
+          "wash: a Terrible office washes red");
+    t.type = ITEM_ELEVATOR_SHAFT;
+    CHECK(!overlay_world_color(&t, MAP_VIEW_EVAL, c), "wash: never a shaft");
+    t.type = ITEM_FLOOR;
+    CHECK(!overlay_world_color(&t, MAP_VIEW_EVAL, c), "wash: never a bare floor");
+    t.type = ITEM_OFFICE;
+    CHECK(!overlay_world_color(&t, MAP_VIEW_PLAIN, c), "wash: off in the plain map");
+#undef RGB_IS
+}
+
 int main(void)
 {
+    test_map_overlay();
     test_view_zoom();
     test_touch();
     test_hints();
