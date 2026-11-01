@@ -172,10 +172,13 @@ Deliberate additions over the 1994 game, ported from the sister project
 BrandyTower. They sit on top of the faithful base — at 1x on a 960x720 window
 the frame is byte-identical to the original layout — and change no mechanics.
 
-- **Zoom** — whole steps from 0.5x to 4x (`[` `]` `Z`, Ctrl/Cmd +/-,
-  Ctrl/Cmd+wheel, trackpad or touch pinch, View menu), always about the
-  cursor. The world is drawn into an offscreen target and scaled by whole
-  pixels, so the original art never softens; the Win3.1 windows stay 1x.
+- **Zoom** — 0.5x to 4x (0.5, 0.625, 0.75, 0.875, 1, 1.5, 2, 3, 4) via
+  `[` `]` `Z`, Ctrl/Cmd +/-, Ctrl/Cmd+wheel, trackpad or touch pinch, or
+  the View menu, always about the cursor. The world is drawn into an
+  offscreen target and scaled nearest-neighbour whenever a world pixel is
+  a whole number of device pixels (1x-4x everywhere, 0.5x and 1.5x on
+  Retina too), so the original art never softens there; the in-between
+  zoomed-out steps are smoothly filtered. The Win3.1 windows stay 1x.
   (`src/view.h`)
 - **A view that fits the screen** — the web canvas fills the browser window
   at whole device pixels per pixel (fractional only on small 2x phones),

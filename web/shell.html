@@ -104,7 +104,8 @@
   /* Bottom-right: the top edge belongs to the Win3.1 menu bar. */
   #mutebtn, #fsbtn {
     position: absolute; z-index: 5;
-    bottom: calc(6px + env(safe-area-inset-bottom, 0px));
+    /* --ct-dock-inset: the Modern UI's bottom dock on a phone (ctDockInset) */
+    bottom: calc(6px + var(--ct-dock-inset, 0px) + env(safe-area-inset-bottom, 0px));
     opacity: .7;
     background: rgba(20,20,20,.75); color: #d8d8d4;
     border: 1px solid #3a3a36; border-radius: 5px;
@@ -1142,6 +1143,15 @@
     catch (e) {}
     document.body.classList.toggle('ui-modern', !!modern);
   };
+  /* Engine hook: the Modern UI dock's height along the bottom edge, in
+   * logical px (0 = none; main.c layout_windows). The corner buttons ride
+   * above it instead of covering its items. */
+  var dockInset = 0;
+  function applyDockInset() {
+    var css = lastView && lastView.h ? dockInset * lastView.cssH / lastView.h : 0;
+    document.documentElement.style.setProperty('--ct-dock-inset', css + 'px');
+  }
+  window.ctDockInset = function (px) { dockInset = px; applyDockInset(); };
   window.ctStarEvent = function (star, day) {
     ctEvent('star-' + (star >= 6 ? 'tower' : star) + '/d' + day);
     ctRoster({ s: star, d: day });
@@ -1198,6 +1208,7 @@
         (!lastView || lastView.w !== v.w || lastView.h !== v.h))
       Module.ccall('ct_set_view', null, ['number', 'number'], [v.w, v.h]);
     lastView = v;
+    applyDockInset();
     return v;
   }
   var fitTimer = 0;

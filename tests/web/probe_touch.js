@@ -98,8 +98,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const cellAt = (s, floor, cell) => {
     const vx = cell * CELL_W - Math.trunc(s.cx) + Math.trunc(s.vw / 2) + CELL_W / 2;
     const vy = -floor * CELL_H - Math.trunc(s.cy) + Math.trunc(s.vh / 2) + CELL_H / 2;
-    const z = [0.5, 1, 2, 3, 4][s.zoom];
-    return css(vx * z, vy * z);
+    return css(vx * s.z, vy * s.z);
   };
   /* Touch events built in the page (CDP's Input.dispatchTouchEvent hangs
    * in headless Chrome on this canvas). `pts` is every finger still down,
@@ -135,7 +134,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   console.log('touch probe (412x860 @2x):');
   let s = await state();
   check(cv.w >= 480 && cv.cw <= 412.5, `canvas ${cv.w}x${cv.h} logical fits the phone (css ${cv.cw}x${cv.ch})`);
-  check(s.zoom === 2, 'a touch-first device opens at 2x');
+  check(s.z === 2, 'a touch-first device opens at 2x');
   check(s.map === 0, 'narrow view starts without the minimap');
   await cdp.screenshot(path.join(OUT, '1-portrait.png'));
 

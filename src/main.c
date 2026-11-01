@@ -714,7 +714,7 @@ typedef struct {
 #define ACT_EXPORT_SAV    30   /* Game menu: portable web-save download */
 #define ACT_MANUAL        31   /* Help menu: original 1994 manual (archive.org)
                                   in a new tab (Jonah 2026-09-11) */
-#define ACT_ZOOM_IN       32   /* View menu (port addition): whole-step zoom */
+#define ACT_ZOOM_IN       32   /* View menu (port addition): step zoom */
 #define ACT_ZOOM_OUT      33
 #define ACT_ZOOM_RESET    34
 #define ACT_SPEED_FASTMODE 35  /* Speed menu: uncapped (the EXE's Fast Mode) */
@@ -9527,10 +9527,6 @@ static void render(void)
                 game.view_w, game.view_h);
             game.world_tex_w = game.view_w;
             game.world_tex_h = game.view_h;
-#if SDL_VERSION_ATLEAST(2, 0, 12)
-            if (game.world_tex)
-                SDL_SetTextureScaleMode(game.world_tex, SDL_ScaleModeNearest);
-#endif
         }
         if (game.world_tex) {
             SDL_SetRenderTarget(game.renderer, game.world_tex);
@@ -9578,6 +9574,12 @@ static void render(void)
         SDL_SetRenderTarget(game.renderer, NULL);
         SDL_Rect dst = { 0, 0, (int)(game.view_w * game.zoom),
                          (int)(game.view_h * game.zoom) };
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+        /* whole device px per world px: nearest; in-between steps: linear */
+        SDL_SetTextureScaleMode(game.world_tex,
+            view_zoom_is_crisp(game.zoom, game.px_scale) ? SDL_ScaleModeNearest
+                                                         : SDL_ScaleModeLinear);
+#endif
         SDL_RenderCopy(game.renderer, game.world_tex, NULL, &dst);
     }
     ui_chrome_begin();         /* Modern UI: the remap covers the chrome */
@@ -12156,7 +12158,9 @@ static void render_tooltip(void)
     int n = dock_tooltip(x, y, lines, HINT_LINES, &a);
     if (n > 0) {
         if (game.narrow_layout)
-            draw_hint_box(lines, n, a.x, a.y - DOCK_PAD - DOCK_HEAD_H - 6,
+            /* 40px up: clear of the web shell's corner buttons, which
+             * ride just above the strip */
+            draw_hint_box(lines, n, a.x, a.y - DOCK_PAD - DOCK_HEAD_H - 40,
                           HINT_ABOVE, max_w);
         else
             draw_hint_box(lines, n, DOCK_W + 6, a.y, HINT_AT, max_w);
@@ -12290,6 +12294,12 @@ static void layout_windows(void)
     clamp_win(&game.tool_x, &game.tool_y, TOOL_WIN_W, tool_win_height());
     clamp_win(&game.elv_x, &game.elv_y, ELV_W, WIN_TITLEBAR_H);
     clamp_win(&game.fin_x, &game.fin_y, FIN_DLG_W, WIN_TITLEBAR_H);
+#ifdef __EMSCRIPTEN__
+    /* The shell's HTML corner buttons sit bottom-right: lift them over the
+     * Modern UI's bottom dock (logical px; 0 when there is none). */
+    EM_ASM({ if (window.ctDockInset) window.ctDockInset($0); },
+           dock_active() && narrow ? DOCK_H : 0);
+#endif
 }
 
 /* Native HiDPI (macOS Retina): the renderer's output is k x the window's
@@ -12369,10 +12379,10 @@ EMSCRIPTEN_KEEPALIVE const char *ct_view_state(void)
 {
     static char buf[256];
     snprintf(buf, sizeof buf,
-             "{\"zoom\":%d,\"cx\":%.1f,\"cy\":%.1f,\"sw\":%d,\"sh\":%d,"
+             "{\"zoom\":%d,\"z\":%g,\"cx\":%.1f,\"cy\":%.1f,\"sw\":%d,\"sh\":%d,"
              "\"vw\":%d,\"vh\":%d,\"money\":%ld,\"pending\":%d,"
              "\"build\":%d,\"map\":%d,\"mode\":%d,\"ui\":%d}",
-             game.zoom_idx, game.cam_fx, game.cam_fy, game.screen_w,
+             game.zoom_idx, (double)game.zoom, game.cam_fx, game.cam_fy, game.screen_w,
              game.screen_h, game.view_w, game.view_h, (long)game.tower.money,
              game.place_pending, (int)game.build_type, game.win_map,
              game.map_mode, game.ui_modern);
@@ -13500,13 +13510,13 @@ int main(int argc, char *argv[])
                           exe_dlg_text((uint16_t)(0xBD6 + st - 2), 1, "OK"));
     }
     (void)show_underground;
-    {   /* start at a zoom step (index into VIEW_ZOOM_STEPS): --zoom=N from
-         * the web shell (touch devices open at 2x), CT_ZOOM for tests */
-        int zi = getenv("CT_ZOOM") ? atoi(getenv("CT_ZOOM")) : -1;
+    {   /* start at a zoom factor (nearest VIEW_ZOOM_STEPS entry): --zoom=2
+         * from the web shell (touch devices open at 2x), CT_ZOOM for tests */
+        float zf = getenv("CT_ZOOM") ? (float)atof(getenv("CT_ZOOM")) : 0.0f;
         for (int i = 1; i < argc; i++)
-            if (!strncmp(argv[i], "--zoom=", 7)) zi = atoi(argv[i] + 7);
-        if (zi >= 0)
-            zoom_set(zi, game.screen_w / 2, game.screen_h / 2);
+            if (!strncmp(argv[i], "--zoom=", 7)) zf = (float)atof(argv[i] + 7);
+        if (zf > 0.0f)
+            zoom_set(view_zoom_index_for(zf), game.screen_w / 2, game.screen_h / 2);
     }
     
     printf("\n=== ConciliaTower running ===\n");

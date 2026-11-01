@@ -119,6 +119,16 @@
 - [x] Optional Modern UI skin (2026-10-31): Options → Modern UI, dark glass,
   same geometry and hit-tests; classic frame verified byte-identical across
   the off-screen capture set. `src/ui_skin.c` (+ `tests/web/probe_modern_ui.js`)
+- [x] Modern UI build dock (2026-10-31): BrandyTower's palette replaces the
+  Win3.1 toolbox in the Modern skin — every item under a group heading
+  (Tools / Structure / Elevators / Tenants / Hotel / Commerce / Services /
+  Below / Landmark), icon over name, locked items greyed not hidden. A
+  side column on wide views (wheel scrolls it); on narrow views a bottom
+  strip that slides sideways with a fling. Hover (long-press on touch)
+  tooltips say what each item does and what it takes (`hints_tool`).
+  Touch placement confirm box: 44px nudge pads with larger arrows. Web
+  shell lifts its corner buttons over the strip (`ctDockInset`).
+  `tests/web/probe_dock.js`
 - [ ] Modern UI follow-ups: redraw the elevator and finance dialogs
   procedurally (today: original bitmaps in a glass frame); a dark-glass
   tenant-picture frame and analytics plot palette.

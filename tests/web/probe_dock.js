@@ -161,13 +161,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await cdp.screenshot(path.join(OUT, '2_phone_slid.png'));
 
   /* a locked item (Metro, 4 stars) stays greyed and unpicked */
+  /* slide until Metro (near the far end) is wholly on screen */
   d = await dock();
-  const metro = slotOf(d, ITEM.METRO);
-  if (metro.r[0] + metro.r[2] > d.view[2]) {
-    /* off the right edge: slide it into view first */
-    await touch('touchStart', [{ x: cv.x + cv.cw * 0.9, y: centre(metro.r).y }]);
+  for (let tries = 0; tries < 8; tries++) {
+    const r = slotOf(d, ITEM.METRO).r;
+    if (r[0] >= 0 && r[0] + r[2] <= d.view[2]) break;
+    const y = centre(r).y;
+    await touch('touchStart', [{ x: cv.x + cv.cw * 0.9, y }]);
     for (let k = 1; k <= 12; k++) {
-      await touch('touchMove', [{ x: cv.x + cv.cw * 0.9 - k * 30, y: centre(metro.r).y }]);
+      await touch('touchMove', [{ x: cv.x + cv.cw * 0.9 - k * 25, y }]);
       await sleep(16);
     }
     await touch('touchEnd', []);
@@ -177,7 +179,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const metroNow = slotOf(d, ITEM.METRO);
   await tap(centre(metroNow.r));
   s = await state();
-  check(s.build === ITEM.LOBBY, 'tap on locked Metro leaves the tool alone');
+  check(metroNow.r[0] + metroNow.r[2] <= d.view[2], `Metro slid into view (x ${metroNow.r[0]})`);
+  check(s.build === ITEM.LOBBY && s.pending === 0,
+        'tap on locked Metro leaves the tool alone and builds nothing');
 
   /* long-press a slot: its tooltip pins above the strip */
   const lp = centre(metroNow.r);

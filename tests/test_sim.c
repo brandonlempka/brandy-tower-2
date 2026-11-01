@@ -3733,7 +3733,7 @@ static void test_load_renormalize(void)
     remove("/tmp/ct_test_v14.sav");
 }
 
-/* view.h: zoom steps stay whole-pixel and zooming about a point keeps
+/* view.h: zoom steps, crisp-vs-filtered blits, and zooming about a point keeps
  * the world point under it (BrandyTower camera.ts zoomTo, ported). */
 static void test_view_zoom(void)
 {
@@ -3744,6 +3744,15 @@ static void test_view_zoom(void)
     CHECK(view_virtual_extent(960, 0.5f) == 1920, "0.5x doubles the view");
     CHECK(view_virtual_extent(961, 2.0f) == 481, "2x rounds the view up");
     CHECK(view_virtual_extent(1000, 3.0f) == 334, "3x covers the last px");
+    CHECK(view_zoom_index_for(2.0f) == VIEW_ZOOM_DEFAULT + 2 &&
+          view_zoom_index_for(0.74f) == VIEW_ZOOM_DEFAULT - 2 &&
+          view_zoom_index_for(99.0f) == VIEW_ZOOM_COUNT - 1, "factor -> nearest step");
+    CHECK(view_zoom_is_crisp(1.0f, 1) && view_zoom_is_crisp(3.0f, 1) &&
+          view_zoom_is_crisp(0.5f, 2) && view_zoom_is_crisp(1.5f, 2) &&
+          !view_zoom_is_crisp(0.5f, 1) && !view_zoom_is_crisp(0.75f, 2) &&
+          !view_zoom_is_crisp(1.5f, 1), "crisp only at whole device px");
+    for (int i = 1; i < VIEW_ZOOM_COUNT; i++)
+        CHECK(VIEW_ZOOM_STEPS[i] > VIEW_ZOOM_STEPS[i - 1], "steps ascend");
     CHECK(view_screen_to_virtual(5, 2.0f) == 2 &&
           view_screen_to_virtual(-1, 2.0f) == -1, "screen->virtual floors");
 

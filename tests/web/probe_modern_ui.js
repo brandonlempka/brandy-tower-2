@@ -1,7 +1,7 @@
 /* Probe: Options -> Modern UI in the WEB build (port addition, 2026-10-31).
  * Boots web/dist with a fixture tower, flips Options -> Modern UI through
  * the real menu, checks the shell remembered it (localStorage 'ct-ui' and
- * body.ui-modern), opens the Eval view and a toolbox pull-down, then
+ * body.ui-modern), opens the Eval view and hovers a build-dock item, then
  * reloads and checks the next launch comes up modern (--ui=modern).
  *
  * Usage: CHROME=<chrome> SIMTOWER_EXE=<exe> node tests/web/probe_modern_ui.js
@@ -24,9 +24,11 @@ const SAV = process.env.PROBE_SAV ||
 /* Game-pixel spots at the 960x720 view (menu layout from main.c). */
 const OPTIONS_MENU = [507, 9];
 const MODERN_ITEM = [520, 178];     /* last Options item */
-const MAP_TAB = [28, 289];          /* map window tab strip */
-const EVAL_TAB = [78, 289];
-const HOTEL_GROUP = [20, 460];      /* a toolbox group with a pull-down */
+/* The Modern UI's build dock takes the left 96px, so the map window sits
+ * just right of it (main.c DOCK_W, layout_windows). */
+const DOCK_W = 96;
+const MAP_TAB = [DOCK_W + 28, 289];  /* map window tab strip */
+const EVAL_TAB = [DOCK_W + 78, 289];
 
 function findExe() {
   const cands = [
@@ -134,19 +136,20 @@ function check(cond, msg) {
         'shell buttons switched to the glass style');
   await cdp.screenshot(path.join(OUT, '3_modern.png'));
 
-  console.log('== Eval view + toolbox pull-down');
+  console.log('== Eval view + build dock');
   const mapMode = async () => (await viewState()).mode;
-  await click(...MAP_TAB);
-  check(await mapMode() === 0, 'Map tab hit-tests in the modern skin (map_mode 0)');
   await click(...EVAL_TAB);
-  check(await mapMode() === 1,
-        'Eval tab still hit-tests in the modern skin (map_mode 1)');
+  check(await mapMode() === 1, 'Eval tab hit-tests beside the dock (map_mode 1)');
+  await click(...MAP_TAB);
+  check(await mapMode() === 0, 'Map tab hit-tests beside the dock (map_mode 0)');
+  await click(...EVAL_TAB);
   await cdp.screenshot(path.join(OUT, '4_modern_eval.png'));
-  await mouse('mouseMoved', ...HOTEL_GROUP);
-  await mouse('mousePressed', ...HOTEL_GROUP);
-  await new Promise(r => setTimeout(r, 700));
-  await cdp.screenshot(path.join(OUT, '5_modern_pulldown.png'));
-  await mouse('mouseReleased', ...HOTEL_GROUP);
+  const dock = JSON.parse(await cdp.eval(`Module.ccall('ct_dock_state','string',[],[])`));
+  check(dock.active === 1 && dock.horizontal === 0, 'build dock is a side column');
+  const office = dock.slots.find((sl) => sl.item === 3);
+  await mouse('mouseMoved', office.r[0] + office.r[2] / 2, office.r[1] + office.r[3] / 2);
+  await new Promise(r => setTimeout(r, 900));
+  await cdp.screenshot(path.join(OUT, '5_modern_dock_tooltip.png'));
 
   console.log('== reload: remembered?');
   await cdp.eval(`window.ctAutosave && 0`);
